@@ -1,0 +1,5 @@
+Module peer
+Init init_function
+Function VOID set(PRIV_VCL, STRING, INT)
+Function VOID queue_req(PRIV_VCL)
+Function INT pending(PRIV_VCL)
