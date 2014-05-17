@@ -30,6 +30,11 @@ AC_ARG_ENABLE([debug],
                   [turn on full symbol generation, disable optimization and out debug messages])],
   [CFLAGS="-ggdb3 -Wall"
    CPPFLAGS="$CPPFLAGS${CPPFLAGS:+ }-DDEBUG"])
+AC_ARG_ENABLE([devel],
+  [AC_HELP_STRING([--enable-devel],
+                 [enable all warnings, pedantic mode and full debug symbol generation])],
+  [CFLAGS="-ggdb3 -Wall -pedantic"
+  CPPFLAGS="$CPPFLAGS${CPPFLAGS:+ }-DDEBUG"])
 
 # Check for rst utilities
 AC_CHECK_PROGS(RST2MAN, [rst2man rst2man.py], "no")
