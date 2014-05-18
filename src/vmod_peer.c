@@ -53,8 +53,8 @@ struct vmod_pthr {
   struct vmod_peer *vp;
 };
 
+static int initialized = 0;
 static vp_lock_t *curl_locks[CURL_LOCK_DATA_LAST+1];
-static pthread_key_t cur_lock_key;
 
 static inline
 char *vp_alloc(char *b, size_t *bsz, size_t sz)
@@ -341,7 +341,7 @@ int vp_queue_req(struct vmod_peer *vp, struct peer_req *r, struct sess *sp)
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
 
   AZ(pthread_mutex_lock(&vp->mtx));
-  if(vp->qlen+1 / vp->nthreads > VMOD_PEER_MAX_QUEUE_DEPTH) {
+  if((vp->qlen+1) / vp->nthreads > VMOD_PEER_MAX_QUEUE_DEPTH) {
     if(vp->nthreads >= vp->max || vp_start_thread(vp) != 0) {
       VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: queue depth would exceed %u/%u, waiters=%u, add more threads?",
               (unsigned)vp->qlen, (unsigned)vp->nthreads, (unsigned)vp->nwaiters);
@@ -658,26 +658,17 @@ void vmod_peer_stop(void *v)
     VPFREE(ctx->threads);
   ctx->magic = 0;
   free(ctx);
-}
 
-static
-curl_lock_access vp_lock_access_get(pthread_key_t *k)
-{
-  curl_lock_access *ap = pthread_getspecific(*k);
-  AN(ap);
-  return *ap;
-}
-
-static
-void vp_lock_access_set(pthread_key_t *k, curl_lock_access a)
-{
-  curl_lock_access *ap = pthread_getspecific(*k);
-  if(ap == NULL) {
-    ap = calloc(1,sizeof(*ap));
-    AN(ap);
+  if(--initialized == 0) {
+    int i;
+    for(i = CURL_LOCK_DATA_NONE; i <= CURL_LOCK_DATA_LAST; i++) {
+      vp_lock_t *l = curl_locks[i];
+      curl_locks[i] = NULL;
+      if(l)
+        vp_lock_destroy(l);
+    }
+    curl_global_cleanup();
   }
-  *ap = a;
-  AZ(pthread_setspecific(*k,ap));
 }
 
 static
@@ -686,7 +677,6 @@ void vp_lock_curl_data(CURLSH *s, curl_lock_data data, curl_lock_access access, 
 #if 0
   VSL(SLT_Debug, 0, "vp_lock_curl_data data=%d access=%d",(int)data,(int)access);
 #endif
-  vp_lock_access_set((pthread_key_t*)va,access);
   if(access == CURL_LOCK_ACCESS_SHARED)
     AZ(vp_lock_read_acquire(curl_locks[data]));
   else if(access == CURL_LOCK_ACCESS_SINGLE)
@@ -696,20 +686,15 @@ void vp_lock_curl_data(CURLSH *s, curl_lock_data data, curl_lock_access access, 
 static
 void vp_unlock_curl_data(CURLSH *s, curl_lock_data data, void *va)
 {
-  curl_lock_access access = vp_lock_access_get((pthread_key_t*)va);
 #if 0
   VSL(SLT_Debug, 0, "vp_unlock_curl_data data=%d access=%d",(int)data,(int)access);
 #endif
-  if(access == CURL_LOCK_ACCESS_SHARED)
-    AZ(vp_lock_read_release(curl_locks[data]));
-  else if(access == CURL_LOCK_ACCESS_SINGLE)
-    AZ(vp_lock_write_release(curl_locks[data]));
+  AZ(vp_lock_release(curl_locks[data]));
 }
 
 /* vmod initialization */
 int init_function(struct vmod_priv *priv, const struct VCL_conf *conf)
 {
-  static int initialized = 0;
   int rv = 0;
   struct vmod_peer *ctx;
 
@@ -741,10 +726,11 @@ int init_function(struct vmod_priv *priv, const struct VCL_conf *conf)
       AN(curl_locks[i]);
     }
     AZ(pthread_mutexattr_destroy(&attr));
-    AZ(pthread_key_create(&cur_lock_key,free));
     rv = curl_global_init(CURL_GLOBAL_ALL);
     initialized = 1;
-  }
+  } else
+    initialized++;
+
   if(rv == 0) {
     ctx->csh = curl_share_init();
     AN(ctx->csh);
@@ -752,7 +738,7 @@ int init_function(struct vmod_priv *priv, const struct VCL_conf *conf)
     AZ(curl_share_setopt(ctx->csh, CURLSHOPT_UNLOCKFUNC, vp_unlock_curl_data));
     AZ(curl_share_setopt(ctx->csh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS));
     AZ(curl_share_setopt(ctx->csh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION));
-    AZ(curl_share_setopt(ctx->csh, CURLSHOPT_USERDATA, &cur_lock_key));
+    AZ(curl_share_setopt(ctx->csh, CURLSHOPT_USERDATA, ctx));
     while(rv == 0 && ctx->nthreads < ctx->min)
       rv = vp_start_thread_safe(ctx);
   }

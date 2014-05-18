@@ -1,11 +1,22 @@
 import std;
 import peer;
 
+probe healthcheck {
+  .url = "/server-status";
+  .interval = 6s;
+  .timeout = 2s;
+  .window = 8;
+  .threshold = 5;
+  .initial = 2;
+  .expected_response = 403;
+}
+
 backend rpxy005t {
   .host = "152.52.29.46";
   .port = "80";
   .connect_timeout = 3s;
   .first_byte_timeout = 3s;
+  .probe = healthcheck;
 }
 
 backend rpxy012t {
@@ -13,6 +24,15 @@ backend rpxy012t {
   .port = "80";
   .connect_timeout = 2s;
   .first_byte_timeout = 2s;
+  .probe = healthcheck;
+}
+
+backend kcstar {
+  .host = "166.108.31.147";
+  .port = "80";
+  .connect_timeout = 3s;
+  .first_byte_timeout = 6s;
+  .probe = healthcheck;
 }
 
 director x round-robin {
@@ -22,19 +42,22 @@ director x round-robin {
   {
     .backend = rpxy012t;
   }
+  {
+    .backend = kcstar;
+  }
 }
 
 sub vcl_init {
-  peer.set("152.52.29.39",8888);
-  peer.set_connect_timeout(100);
-  peer.set_timeout(200);
-  peer.set_threads(2, 0);
+  peer.set("152.52.29.46",99);
+  peer.set_connect_timeout(11000);
+  peer.set_timeout(30000);
+  peer.set_threads(1, 2);
 }
 
 sub vcl_recv {
   if (req.restarts == 0) {
     set req.backend = x;
-    set req.http.host = "qa1.kansascity.com";
+    set req.http.host = "eprod.kansascity.com";
     unset req.http.cookie;
   }
 
@@ -60,22 +83,18 @@ Pending peer requests: "} + req.http.Peer-Pending-Requests + {"
 sub vcl_hit {
   set req.http.connection = "close";
   set req.http.proxy-connection = "close";
-  set req.http.Orig-Request = req.request;
-  set req.request = "PURGE";
-  peer.queue_req();
-  set req.request = req.http.Orig-Request;
-  unset req.http.Orig-Request;
+  set req.http.Host = "www.kansascitystar.com";
   peer.queue_req();
 }
 
 sub vcl_miss {
-  set req.request = "PURGE";
-  peer.queue_req();
   set req.request = bereq.request;
   if (bereq.request == "HEAD") {
     set bereq.request = "GET";
   }
+  set req.http.Host = "www.kansascity.com";
   peer.queue_req();
+  set req.http.Host = bereq.http.Host;
 }
 
 sub vcl_pass {

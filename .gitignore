@@ -32,3 +32,4 @@ stamp-h1
 /*.vcl
 
 /src/vcc_if.*
+/man/*.3

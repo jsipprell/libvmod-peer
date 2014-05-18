@@ -18,7 +18,7 @@
 
 #ifndef VMOD_PEER_MAX_QUEUE_DEPTH
 /* maximum number of http requests allowed to be queued up before discarding new ones */
-#define VMOD_PEER_MAX_QUEUE_DEPTH 100
+#define VMOD_PEER_MAX_QUEUE_DEPTH 50
 #endif
 
 typedef struct vp_lock vp_lock_t;
@@ -26,8 +26,7 @@ typedef struct vp_lock vp_lock_t;
 extern vp_lock_t *vp_lock_new(pthread_mutexattr_t*,pthread_condattr_t*);
 extern void vp_lock_destroy(vp_lock_t*);
 extern int vp_lock_read_acquire(vp_lock_t*);
-extern int vp_lock_read_release(vp_lock_t*);
 extern int vp_lock_write_acquire(vp_lock_t*);
-extern int vp_lock_write_release(vp_lock_t*);
+extern int vp_lock_release(vp_lock_t*);
 
 #endif /* VMOD_PEER_H */
