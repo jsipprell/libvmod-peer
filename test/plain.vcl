@@ -1,5 +1,4 @@
 import std;
-import peer;
 
 backend rpxy005t {
   .host = "152.52.29.46";
@@ -24,12 +23,6 @@ director x round-robin {
   }
 }
 
-sub vcl_init {
-  peer.set("152.52.29.39",8888);
-  peer.set_connect_timeout(100);
-  peer.set_timeout(200);
-}
-
 sub vcl_recv {
   if (req.restarts == 0) {
     set req.backend = x;
@@ -37,47 +30,12 @@ sub vcl_recv {
     unset req.http.cookie;
   }
 
-  if (req.url == "/status") {
-    set req.http.Peer-Pending-Requests = peer.pending();
-    error 200 "Status";
-  }
-}
-
-sub vcl_error {
-  if (obj.status == 200 && req.url == "/status") {
-    set obj.http.Content-Type = "text/plain";
-    synthetic {"
-Pending peer requests: "} + req.http.Peer-Pending-Requests + {"
-"};
-    return (deliver);
-  }
 }
 
 sub vcl_hit {
   set req.http.connection = "close";
   set req.http.proxy-connection = "close";
   set req.http.Orig-Request = req.request;
-  set req.request = "PURGE";
-  peer.queue_req();
-  set req.request = req.http.Orig-Request;
-  unset req.http.Orig-Request;
-  peer.queue_req();
-}
-
-sub vcl_miss {
-  set req.request = "PURGE";
-  peer.queue_req();
-  set req.request = bereq.request;
-  if (bereq.request == "HEAD") {
-    set bereq.request = "GET";
-  }
-  peer.queue_req();
-}
-
-sub vcl_pass {
-  set req.request = "PURGE";
-  peer.queue_req();
-  set req.request = bereq.request;
 }
 
 sub vcl_fetch {

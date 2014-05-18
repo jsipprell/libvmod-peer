@@ -9,6 +9,7 @@ libvmod_peer_la_LIBADD = @CURL_LIBS@
 libvmod_peer_la_SOURCES = \
 		vcc_if.c \
 		vcc_if.h \
+    locks.c \
 		vmod_peer.h \
 		vmod_peer.c
 
