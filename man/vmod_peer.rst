@@ -158,3 +158,93 @@ Example
                 set req.request = "GET";
             }
 
+queue_req_body
+--------------
+
+Prototype
+        ::
+
+            queue_req_body(STRING_LIST)
+Return value
+        VOID
+Description
+        Identical to `peer.queue_rec()` except that it takes a single
+        argument which will be used as HTTP ``POST`` content.  The content
+        will be automatically URL-encoding before being sent. Note that using
+        this function will cause the HTTP operation to *always* operate as a
+        ``POST`` irrespective of value of `req.request` (although
+        `req.request` will be the method actually sent in the HTTP command).
+Example
+        ::
+
+            // Send an HTTP POST.
+            set req.request = "POST';
+            peer.queue_req_body({"Form entry
+            sent "} + now);
+
+threads
+-------
+
+Prototype
+        ::
+
+            threads(VOID)
+Return value
+        INT
+Description
+        Returns the number of threads currently running in the thread pool
+        dedicated to handling `vmod_peer` HTTP requests. No distinction is
+        made between busy threads and those waiting for new requests but
+        this can generally be estimated by examining this value and the
+        ``peer.pending()`` value.
+
+pending
+-------
+
+Prototype
+        ::
+
+            pending(VOID)
+Return value
+        INT
+Description
+        Returns the number of outstanding HTTP requests that have not
+        yet been processed. Requests are considered pending up until
+        they are initiated, **not** when completed.
+
+min_threads
+-----------
+
+Prototype
+        ::
+
+            min_threads(VOID)
+Return value
+        INT
+Description
+        Returns the minimum number of threads maintained by the HTTP request
+        handling pool. This number should be the same as the first argument in
+        the most recent call to ``peer.set_threads(min,max);``.
+
+        The default value is 1.
+
+max_threads
+-----------
+
+Prototype
+        ::
+
+          max_threads(VOID)
+Return value
+        INT
+Description
+        Returns the maximum number of threads maintained by the HTTP
+        request handling pool. This number should be the same as the first
+        argument in the most recent call to ``peer.set_threads(min,max);``
+
+        The default value is 1.
+
+        If the maximum has been set to a value greater than the minimum,
+        the number of actively running threads will be adjusted dynamically
+        based on the pending queue size.
+
