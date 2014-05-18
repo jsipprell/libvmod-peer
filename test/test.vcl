@@ -28,6 +28,7 @@ sub vcl_init {
   peer.set("152.52.29.39",8888);
   peer.set_connect_timeout(100);
   peer.set_timeout(200);
+  peer.set_threads(2, 0);
 }
 
 sub vcl_recv {
@@ -48,6 +49,9 @@ sub vcl_error {
     set obj.http.Content-Type = "text/plain";
     synthetic {"
 Pending peer requests: "} + req.http.Peer-Pending-Requests + {"
+          Min Threads: "} + peer.min_threads() + {"
+          Max Threads: "} + peer.max_threads() + {"
+        Alive Threads: "} + peer.threads() + {"
 "};
     return (deliver);
   }
