@@ -1,5 +1,7 @@
-AC_PREREQ([2.59])
-AC_COPYRIGHT([Copyright (c) 2014 Jesse Sipprell])
+AC_PREREQ([2.63])
+AC_COPYRIGHT([Copyright (c) 2014 Jesse Sipprell
+All Rights Reserved])
+builtin(include, m4/compat.m4)dnl
 AC_INIT([libvmod-peer], [0.1])
 AC_CONFIG_MACRO_DIR(m4)
 AC_CONFIG_AUX_DIR(build)
