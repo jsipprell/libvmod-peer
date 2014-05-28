@@ -918,10 +918,10 @@ void vmod_set_timeout(struct sess *sp, struct vmod_priv *priv, int ms)
 }
 
 /* add the current request + post body to the pending list */
-void vmod_queue_req_body(struct sess *sp, struct vmod_priv *priv,
-                         const char *s, ...)
+static
+void vmod_enqueue_post_ap(struct sess *sp, struct vmod_priv *priv,
+                         const char *s, va_list ap)
 {
-  va_list ap;
   const char *p;
   ssize_t l = 0;
   struct peer_req *r;
@@ -934,7 +934,6 @@ void vmod_queue_req_body(struct sess *sp, struct vmod_priv *priv,
   r = vp_req_init(ctx,sp,NULL);
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
 
-  va_start(ap,s);
   for(p = s; p != vrt_magic_string_end; p = va_arg(ap, const char*)) {
     if (p != NULL) {
       size_t vl = strlen(p);
@@ -947,7 +946,6 @@ void vmod_queue_req_body(struct sess *sp, struct vmod_priv *priv,
       l += vl;
     }
   }
-  va_end(ap);
 
   if(l >= 0)
     (void)vp_queue_req(ctx,r,sp);
@@ -955,8 +953,26 @@ void vmod_queue_req_body(struct sess *sp, struct vmod_priv *priv,
     vp_req_free(r);
 }
 
+void vmod_enqueue_req_body(struct sess *sp, struct vmod_priv *priv,
+                           const char *s, ...)
+{
+  va_list ap;
+  va_start(ap,s);
+  vmod_enqueue_post_ap(sp,priv,s,ap);
+  va_end(ap);
+}
+
+void vmod_queue_req_ap(struct sess *sp, struct vmod_priv *priv,
+                           const char *s, ...)
+{
+  va_list ap;
+  va_start(ap,s);
+  vmod_enqueue_post_ap(sp,priv,s,ap);
+  va_end(ap);
+}
+
 /* add the current request to the pending list */
-void vmod_queue_req(struct sess *sp, struct vmod_priv *priv)
+void vmod_enqueue_req(struct sess *sp, struct vmod_priv *priv)
 {
   struct peer_req *r;
   struct vmod_peer *ctx = (struct vmod_peer*)priv->priv;
@@ -968,4 +984,9 @@ void vmod_queue_req(struct sess *sp, struct vmod_priv *priv)
   r = vp_req_init(ctx,sp,NULL);
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
   (void)vp_queue_req(ctx,r,sp);
+}
+
+void vmod_queue_req(struct sess *sp, struct vmod_priv *priv)
+{
+  vmod_enqueue_req(sp,priv);
 }
