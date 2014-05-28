@@ -8,7 +8,7 @@ AC_CONFIG_AUX_DIR(build)
 AC_CONFIG_SRCDIR([src/vmod_peer.vcc])
 AM_CONFIG_HEADER([config.h])
 
-AC_CANONICAL_SYSTEM
+AC_CANONICAL_TARGET
 AC_LANG(C)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects])
@@ -25,6 +25,8 @@ LT_INIT([disable-static])
 AC_PROG_INSTALL
 AC_PROG_LIBTOOL
 AC_PROG_MAKE_SET
+AC_CHECK_TARGET_TOOL([DIRNAME],[dirname],[])
+
 AC_ARG_ENABLE([debug],
   [AS_HELP_STRING([--enable-debug],
                   [turn on full symbol generation, disable optimization and out debug messages])],
@@ -58,25 +60,24 @@ AC_CHECK_HEADERS([sys/stdlib.h])
 AC_CHECK_PROGS(PYTHON, [python3 python3.1 python3.2 python2.7 python2.6 python2.5 python2 python],
   [AC_MSG_ERROR([Python is needed to build this vmod, please install python.])])
 
-# Varnish source tree
-AC_ARG_WITH([varnish],
-  [AS_HELP_STRING([--with-varnish=DIR],
-                 [location of varnish source code @<:@REQUIRED@:>@])],
-  [varnish_srcdir="$withval"
-   VARNISHSRC=])
+# Varnish includes & vmod dir
+AC_ARG_WITH(varnish,
+  [AS_HELP_STRING([--with-varnish@<:@=DIR@:>@],[Location of Varnish 4 pkg-config (.pc) file])],
+  [AS_IF([test -f "$with_varnish"],
+    [AS_VAR_IF([DIRNAME],[],[],[with_varnish="`$DIRNAME \"$with_varnish\"`"])])
+   AS_IF([test -d "$with_varnish"],,[with_varnish=no])])
 
-AC_ARG_VAR([VARNISHSRC], [path to Varnish source tree (mandatory)])
-AS_VAR_IF([VARNISHSRC],[""],[],[varnish_srcdir="$VARNISHSRC"])
-AS_VAR_IF([varnish_srcdir],[""],[AC_MSG_ERROR([No Varnish source tree specified])])
-
-AS_IF([test -d "$varnish_srcdir"],[],
-  [AC_MSG_ERROR([$varnish_srcdir is not a valid directory])])
-
-varnish_srcdir=`cd $varnish_srcdir && pwd`
-AC_CHECK_FILE([$varnish_srcdir/include/varnishapi.h],
-  [],
-  [AC_MSG_FAILURE(["$varnish_srcdir" is not a Varnish source directory])]
-)
+AS_CASE($with_varnish,
+  [yes],[],
+  [no],[],
+  [''],[],
+  [PKG_CONFIG_PATH="${with_varnish}${PKG_CONFIG_PATH+$PATH_SEPARATOR}${PKG_CONFIG_PATH}"
+   export PKG_CONFIG_PATH])
+PKG_CHECK_EXISTS([varnishapi >= 4.0],,
+  [AC_MSG_ERROR([Varnish 4.0 or better is needed to build this vmod.])])
+VARNISH_VMOD_INCLUDES
+VARNISH_VMOD_DIR
+VARNISH_VMODTOOL
 
 # check if curl supports ms timeout settings
 save_CFLAGS="${CFLAGS}"
@@ -111,12 +112,4 @@ AC_CHECK_FUNC(pthread_rwlock_init,
     [Define if your POSIX threads library supports read/write locks])])
 AC_CHECK_FUNCS([pthread_rwlockattr_setpshared])
 
-# vmod installation dir
-PKG_CONFIG_PATH="$varnish_srcdir:${PKG_CONFIG_PATH+ }$PKG_CONFIG_PATH"
-export PKG_CONFIG_PATH
-PKG_CHECK_VAR([VMODDIR],[varnishapi],[vmoddir],,
-  [AC_MSG_FAILURE([Cannot determine vmod installation directory])])
-
-AC_SUBST([VARNISHSRC],[$varnish_srcdir])
-
-AC_OUTPUT([Makefile src/Makefile man/Makefile])
+AC_OUTPUT([Makefile src/Makefile])

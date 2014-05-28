@@ -2,7 +2,7 @@ ACLOCAL_AMFLAGS = -I m4
 
 doc_DATA = README.md LICENSE
 
-SUBDIRS = src man
+SUBDIRS = src
 
-EXTRA_DIST = m4/compat.m4 m4/pkg.m4 m4/ax_pthread.m4 build/vmod.py build/vmodtool.py \
+EXTRA_DIST = m4/compat.m4 m4/pkg.m4 m4/ax_pthread.m4 m4/varnish.m4 \
              README.md LICENSE
