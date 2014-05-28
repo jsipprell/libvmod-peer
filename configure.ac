@@ -1,6 +1,8 @@
-AC_PREREQ([2.59])
-AC_COPYRIGHT([Copyright (c) 2014 Jesse Sipprell])
-AC_INIT([libvmod-peer], [0.1])
+AC_PREREQ([2.63])
+AC_COPYRIGHT([Copyright (c) 2014 Jesse Sipprell
+All Rights Reserved])
+builtin(include, m4/compat.m4)dnl
+AC_INIT([libvmod-peer], [1.0])
 AC_CONFIG_MACRO_DIR(m4)
 AC_CONFIG_AUX_DIR(build)
 AC_CONFIG_SRCDIR([src/vmod_peer.vcc])
@@ -11,16 +13,14 @@ AC_LANG(C)
 
 AM_INIT_AUTOMAKE([foreign subdir-objects])
 AM_SILENT_RULES([yes])
-
-AC_PROG_CC
 AC_GNU_SOURCE
-LT_INIT([disable-static])
 
-dnl AC_PROG_CC_STDC
-if test "x$ac_cv_prog_cc_c99" = xno; then
-  AC_MSG_ERROR([Could not find a C99 compatible compiler])
-fi
-AC_PROG_CPP
+dnl Pthreads (necessary to test for rwlock capability)
+AX_PTHREAD
+AS_VAR_IF([ax_pthread_ok],[yes],[],
+  [PTHREAD_CC=gcc])
+AC_PROG_CC([$PTHREAD_CC])
+LT_INIT([disable-static])
 
 AC_PROG_INSTALL
 AC_PROG_LIBTOOL
@@ -30,13 +30,21 @@ AC_ARG_ENABLE([debug],
                   [turn on full symbol generation, disable optimization and out debug messages])],
   [CFLAGS="-ggdb3 -Wall"
    CPPFLAGS="$CPPFLAGS${CPPFLAGS:+ }-DDEBUG"])
+AC_ARG_ENABLE([devel],
+  [AC_HELP_STRING([--enable-devel],
+                 [enable all warnings, pedantic mode and full debug symbol generation])],
+  [CFLAGS="-ggdb3 -Wall -pedantic"
+  CPPFLAGS="$CPPFLAGS${CPPFLAGS:+ }-DDEBUG"])
+
+AS_VAR_IF([ax_pthread_ok],[yes],[
+  CFLAGS="$CFLAGS${CFLAGS+ }$PTHREAD_CFLAGS"
+  LIBS="$PTHREAD_LIBS${PTHREAD_LIBS+ }$LIBS"])
 
 # Check for rst utilities
 AC_CHECK_PROGS(RST2MAN, [rst2man rst2man.py], "no")
-if test "x$RST2MAN" = "xno"; then
-        AC_MSG_WARN([rst2man not found - not building man pages])
-fi
-AM_CONDITIONAL(HAVE_RST2MAN, [test "x$RST2MAN" != "xno"])
+AS_VAR_IF([RST2MAN],[no],
+  [AC_MSG_WARN([rst2man not found - not building man pages])])
+AM_CONDITIONAL(HAVE_RST2MAN, [test x"$RST2MAN" != x"no"])
 
 # Check for pkg-config
 PKG_PROG_PKG_CONFIG
@@ -97,15 +105,18 @@ fi
 CFLAGS="${save_CFLAGS}"
 LIBS="${save_LIBS}"
 
+# pthread read/write locks
+AC_CHECK_FUNC(pthread_rwlock_init,
+  [AC_DEFINE([HAVE_PTHREAD_RWLOCKS], [1],
+    [Define if your POSIX threads library supports read/write locks])])
+AC_CHECK_FUNCS([pthread_rwlockattr_setpshared])
+
 # vmod installation dir
-AC_ARG_VAR([VMODDIR], [vmod installation directory @<:@LIBDIR/varnish/vmods@:>@])
-if test "x$VMODDIR" = x; then
-  VMODDIR=`pkg-config --variable=vmoddir varnishapi`
-  if test "x$VMODDIR" = x; then
-    AC_MSG_FAILURE([Cannot determine vmod installation directory])
-  fi
-fi
+PKG_CONFIG_PATH="$varnish_srcdir:${PKG_CONFIG_PATH+ }$PKG_CONFIG_PATH"
+export PKG_CONFIG_PATH
+PKG_CHECK_VAR([VMODDIR],[varnishapi],[vmoddir],,
+  [AC_MSG_FAILURE([Cannot determine vmod installation directory])])
 
 AC_SUBST([VARNISHSRC],[$varnish_srcdir])
 
-AC_OUTPUT([Makefile src/Makefile])
+AC_OUTPUT([Makefile src/Makefile man/Makefile])
