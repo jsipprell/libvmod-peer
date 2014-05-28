@@ -43,8 +43,8 @@ Description
 
         *Note: This function does* **not** *set the HTTP "Host" header.* The
         ``Host`` header is set to whatever the current ``req.http`` headers
-        contain at the time `peer.queue_req()` or `peer.queue_req_body()` is
-        called. If you need to set ``Host`` change ``req.http`` immediately
+        contain at the time `peer.enqueue_req()` or `peer.enqueue_req_body()`
+        is called. If you need to set ``Host`` change ``req.http`` immediately
         before queueing a request and then change it back immediately after.
 Example
         ::
@@ -121,13 +121,13 @@ Example
             // Set connect timeout to .1 seconds
             peer.set_connect_timeout(100);
 
-queue_req
----------
+enqueue_req
+-----------
 
 Prototype
         ::
 
-            queue_req()
+            enqueue_req()
 
 Return value
         VOID
@@ -154,21 +154,21 @@ Example
             // Turn GET requests into PURGEs for a neighboring cache
             if (req.request == "GET") {
                 set req.request = "PURGE";
-                peer.queue_req();
+                peer.enqueue_req();
                 set req.request = "GET";
             }
 
-queue_req_body
---------------
+enqueue_req_body
+----------------
 
 Prototype
         ::
 
-            queue_req_body(STRING_LIST)
+            enqueue_req_body(STRING_LIST)
 Return value
         VOID
 Description
-        Identical to `peer.queue_rec()` except that it takes a single
+        Identical to `peer.enqueue_req()` except that it takes a single
         argument which will be used as HTTP ``POST`` content.  The content
         will be automatically URL-encoding before being sent. Note that using
         this function will cause the HTTP operation to *always* operate as a
@@ -179,7 +179,7 @@ Example
 
             // Send an HTTP POST.
             set req.request = "POST';
-            peer.queue_req_body({"Form entry
+            peer.enqueue_req_body({"Form entry
             sent "} + now);
 
 threads
