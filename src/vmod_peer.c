@@ -16,6 +16,7 @@ typedef struct vmod_hdr {
 struct peer_req {
   unsigned magic;
 #define VMOD_PEER_REQ_MAGIC 0xf4bbef1c
+  const char *tag;
   char *host,*method,*proto,*url;
   struct vsb *body;
   CURL *c;
@@ -43,7 +44,15 @@ struct vmod_peer {
   const char *host;
   int port,c_to,d_to;
   CURLSH *csh;
+
+  /* SSL stuff */
+  const char *ssl_cafile, *ssl_capath;
+  uint32_t ssl_flags;
 };
+
+#define VP_SSL_VERIFY_PEER 0x0001
+#define VP_SSL_VERIFY_HOST 0x0002
+#define VP_SSL_ON          0x0004
 
 struct vmod_pthr {
   unsigned magic;
@@ -57,6 +66,7 @@ struct vmod_pthr {
 };
 
 extern void VTCP_name(const struct suckaddr*,char*,unsigned,char*,unsigned);
+extern double VTIM_real(void);
 
 static int initialized = 0;
 static vp_lock_t *curl_locks[CURL_LOCK_DATA_LAST+1];
@@ -106,7 +116,6 @@ void vp_log_ws_va(struct ws *ws, enum VSL_tag_e tag,
   u = WS_Reserve(ws,0);
   if (u == 0) {
     WS_Release(ws,0);
-    WS_Reset(ws,mark);
     return;
   }
   msg = ws->f;
@@ -204,9 +213,12 @@ struct ws *vmod_peer_ws(pthread_key_t wsk)
 
   ws = pthread_getspecific(wsk);
   AN(cache_param);
-  AN(cache_param->workspace_session);
   if(ws == NULL) {
-    ws = vp_ws_new("vpp",cache_param->workspace_session * 4);
+#ifdef DEBUG
+    ws = vp_ws_new("vpp",cache_param->workspace_thread * 8);
+#else
+    ws = vp_ws_new("vpp",cache_param->workspace_thread);
+#endif
     if(ws != NULL)
       AZ(pthread_setspecific(wsk,ws));
   }
@@ -326,11 +338,15 @@ struct peer_req *vp_req_new(struct vmod_peer *vp) {
   r->magic = VMOD_PEER_REQ_MAGIC;
   r->vp = vp;
   AN(cache_param);
-  AN(cache_param->workspace_session);
   if(!vp_ws_check(vp,&r->ws))
-    r->ws = vp_ws_new("vpq",cache_param->workspace_session * 4);
+#ifdef DEBUG
+    r->ws = vp_ws_new("vpq",cache_param->workspace_thread * 8);
+#else
+    r->ws = vp_ws_new("vpq",cache_param->workspace_thread);
+#endif
   r->c = NULL;
   r->body = NULL;
+  r->tag = "req";
   r->host = r->url = r->proto = r->method = NULL;
   VTAILQ_INIT(&r->headers);
   vp_req_add_header(vp,r,"Connection","close");
@@ -512,16 +528,17 @@ int vp_debug_callback(CURL *c, curl_infotype t, char *msg, size_t sz, void *rv)
     break;
   case CURLINFO_DATA_OUT:
   case CURLINFO_HEADER_OUT:
-    VPLOG_Debug(r->vp,"req:%p > %s", r, b);
+    VPLOG_Debug(r->vp,"%s:%p > %s", r->tag, r, b);
     break;
   case CURLINFO_HEADER_IN:
-    VPLOG_Debug(r->vp,"req:%p < %s", r, b);
+    VPLOG_Debug(r->vp,"%s:%p < %s", r->tag, r, b);
     break;
   case CURLINFO_TEXT:
-    VPLOG_Debug(r->vp,"req:%p: %s", r, b);
+    VPLOG_Debug(r->vp,"%s:%p: %s", r->tag, r, b);
     break;
   default:
-    VPLOG_Debug(r->vp,"req:%p unexpected debug type %d",r,(int)t);
+    VPLOG_Debug(r->vp,"%s:%p unexpected debug type %d (%u bytes)",r->tag,
+                r,(int)t,(unsigned) sz);
     break;
   }
 
@@ -689,22 +706,40 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
   curl_easy_setopt(r->c, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(r->c, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP);
   curl_easy_setopt(r->c, CURLOPT_IGNORE_CONTENT_LENGTH, 1L);
-  if(r->proto && strcasecmp(r->proto,"HTTP/1.0") == 0)
-    curl_easy_setopt(r->c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
-
+  if(r->proto) {
+    if(strcasecmp(r->proto,"HTTP/1.0") == 0)
+      curl_easy_setopt(r->c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+    else if(strcasecmp(r->proto,"HTTP/1.1") == 0)
+      curl_easy_setopt(r->c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
+    else
+      curl_easy_setopt(r->c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_NONE);
+  }
   if(vp->c_to > -1)
     curl_easy_setopt(r->c, CURLOPT_CONNECTTIMEOUT_MS, (long)vp->c_to);
   if(vp->d_to > -1)
     curl_easy_setopt(r->c, CURLOPT_TIMEOUT_MS, (long)vp->d_to);
 
-  bsz = strlen(r->host)+strlen(r->url)+10;
+  if(vp->ssl_flags) {
+    curl_easy_setopt(r->c, CURLOPT_SSL_VERIFYPEER,
+                     (vp->ssl_flags & VP_SSL_VERIFY_PEER) ? 1L : 0L);
+    curl_easy_setopt(r->c, CURLOPT_SSL_VERIFYHOST,
+                     (vp->ssl_flags & VP_SSL_VERIFY_HOST) ? 1L : 0L);
+    if(vp->ssl_cafile)
+      curl_easy_setopt(r->c, CURLOPT_CAINFO, vp->ssl_cafile);
+    if(vp->ssl_capath)
+      curl_easy_setopt(r->c, CURLOPT_CAPATH, vp->ssl_capath);
+  }
+  bsz = strlen(r->host)+strlen(r->url)+12;
   u = WS_Reserve(ws,PRNDUP(bsz));
   if (u <= bsz) {
     WS_Release(ws,0);
-    VPLOG_Error(vp,"req:%p url:%s, nomem (%u bytes allocated, need %u)",r,r->url,u,
-                (unsigned)bsz);
+    VPLOG_Error(vp,"%s:%p url:%s, nomem (%u bytes allocated, need %u)",r->tag,
+                r,r->url,u,(unsigned)bsz);
   } else {
-    cp = stpcpy(ws->f,"http://");
+    if (vp->ssl_flags & VP_SSL_ON)
+      cp = stpcpy(ws->f,"https://");
+    else
+      cp = stpcpy(ws->f,"http://");
     AN(cp);
     cp = stpcpy(cp,r->host);
     AN(cp);
@@ -715,14 +750,14 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
     b = ws->f;
     WS_ReleaseP(ws, cp+1);
     curl_easy_setopt(r->c, CURLOPT_URL, b);
-    VPLOG_Debug(vp,"req:%p url:%s",r,b);
+    VPLOG_Debug(vp,"%s:%p url:%s",r->tag,r,b);
     cr = curl_easy_perform(r->c);
     if(cr != 0) {
       const char *err = curl_easy_strerror(cr);
-      VPLOG_Error(vp,"req:%p (%s) error: %s",r,b,err);
+      VPLOG_Error(vp,"%s:%p (%s) error: %s",r->tag,r,b,err);
     }
     curl_easy_getinfo(r->c, CURLINFO_RESPONSE_CODE, &status);
-    VPLOG_Debug(vp,"req:%p (%s) complete: %ld", r, b, status);
+    VPLOG_Debug(vp,"%s:%p (%s) complete: %ld", r->tag, r, b, status);
   }
   if(req_headers)
     curl_slist_free_all(req_headers);
@@ -930,7 +965,8 @@ struct vmod_peer *init_function(const struct vrt_ctx *ctx)
   vp->tsz = 0;
   vp->host = NULL;
   vp->port = vp->c_to = vp->d_to = -1;
-
+  vp->ssl_flags = 0;
+  vp->ssl_cafile = vp->ssl_capath = NULL;
   if (!initialized) {
     pthread_mutexattr_t attr;
     int i;
@@ -1212,17 +1248,20 @@ void vmod_enqueue_post_va(const struct vrt_ctx *ctx,
   if(ctx->bo != NULL && ctx->req == NULL) {
     /* Called from backend vcl methods, use bereq */
     r = vp_req_init(vp,ctx->http_bereq);
+    CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
+    r->tag = "bereq";
   } else {
     AN(ctx->req);
     r = vp_req_init(vp,ctx->http_req);
+    CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
+    r->tag = "req";
   }
-  CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
 
   for(p = s; p != vrt_magic_string_end; p = va_arg(ap, const char*)) {
     if (p != NULL) {
       size_t vl = strlen(p);
       if(vp_req_append(r,p,vl) != 0 && r->body && r->body->s_error != 0) {
-        VPLOGR(ctx, SLT_VCL_Error, "req:%p (%s) queue_req_body: %s",
+        VPLOGR(ctx, SLT_VCL_Error, "%s:%p (%s) queue_req_body: %s",r->tag,
             p,r->url,strerror(r->body->s_error));
         l = -1;
         break;
@@ -1247,6 +1286,64 @@ V4_VMOD_PEER(ip,enqueue_post,const char *s, ...)
   va_end(ap);
 }
 
+static
+int __match_proto__(req_body_iter_f)
+vp_iter_req_body(struct req *req, void *priv, void *ptr, size_t l)
+{
+  CHECK_OBJ_NOTNULL(req, REQ_MAGIC);
+  AN(priv);
+  return VSB_bcat((struct vsb*)priv,ptr,l);
+}
+
+VCL_VOID
+V4_VMOD_PEER(ip,enqueue_cached_post)
+{
+  struct req *req;
+  int use_bo = 0;
+  struct vsb *b;
+  CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+  CHECK_OBJ_NOTNULL(vmp, VMOD_PEER_IP_MAGIC);
+  if(ctx->bo != NULL && ctx->req == NULL) {
+    req = ctx->bo->req;
+    use_bo++;
+  } else
+    req = ctx->req;
+
+  if(req == NULL) {
+    VSLb((use_bo ? ctx->bo->vsl : ctx->vsl),SLT_VCL_Error,
+          "cannot call enqueue_cached_post() from this vcl handler (no request exists)");
+    return;
+  }
+  b = VSB_new_auto();
+  AN(b);
+  HTTP1_IterateReqBody(req, vp_iter_req_body, b);
+  if(req->req_body_status == REQ_BODY_FAIL || VSB_finish(b) != 0) {
+    VSLb((use_bo ? ctx->bo->vsl : ctx->vsl),SLT_VCL_Error,
+          "enqueue_cached_post() failed retrieving request body (%d): %s",
+          errno,strerror(errno));
+  } else if(req->req_body_status != REQ_BODY_DONE && req->req_body_status != REQ_BODY_CACHED) {
+    VSLb((use_bo ? ctx->bo->vsl : ctx->vsl),SLT_VCL_Error,
+          "enqueue_cached_post() cannot retrieve request body");
+  } else {
+    struct peer_req *r;
+    if(use_bo) {
+      AN(ctx->http_bereq);
+      r = vp_req_init(vmp->vp,ctx->http_bereq);
+      r->tag = "bereq";
+    } else {
+      AN(ctx->http_req);
+      r = vp_req_init(vmp->vp,ctx->http_req);
+      r->tag = "req";
+    }
+    CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
+    r->body = b;
+    b = NULL;
+    (void)vp_enqueue(vmp->vp,r,ctx);
+  }
+  if(b != NULL)
+    VSB_delete(b);
+}
+
 /* add the current request to the pending list */
 VCL_VOID
 V4_VMOD_PEER(ip,enqueue)
@@ -1258,11 +1355,173 @@ V4_VMOD_PEER(ip,enqueue)
   CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
   if(ctx->bo != NULL && ctx->req == NULL) {
     /* Called from backend vcl methods, use bereq */
+    AN(ctx->http_bereq);
     r = vp_req_init(vp,ctx->http_bereq);
+    r->tag = "bereq";
   } else {
-    AN(ctx->req);
+    AN(ctx->http_req);
     r = vp_req_init(vp,ctx->http_req);
+    r->tag = "req";
   }
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
   (void)vp_enqueue(vp,r,ctx);
+}
+
+VCL_VOID
+vmod_cache_post(const struct vrt_ctx *ctx)
+{
+  int i;
+  unsigned u;
+  CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
+
+  if(ctx->method != VCL_MET_RECV) {
+    VSLb(ctx->bo->vsl,SLT_VCL_Error,
+          "cache_post() cannot be called outside of vcl_recv");
+    return;
+  }
+
+  CHECK_OBJ_NOTNULL(ctx->req, REQ_MAGIC);
+  AN(ctx->ws);
+  u = WS_Reserve(ctx->ws,0);
+  i = HTTP1_CacheReqBody(ctx->req,PRNDDN(u+1));
+  WS_Release(ctx->ws,0);
+  if(i == -1)
+    VSLb(ctx->vsl,SLT_VCL_Error,
+         "Cannot cache request body (%d): %s",errno,strerror(errno));
+  else if(ctx->req->req_body_status != REQ_BODY_CACHED)
+    VSLb(ctx->vsl,SLT_VCL_Error,
+         "Unable to cache request body (status:%d)",(int)ctx->req->req_body_status);
+}
+
+VCL_STRING
+V4_VMOD_PEER(ip,body)
+{
+  struct vmod_peer *vp;
+  struct vsb *b;
+  struct req *req = NULL;
+  char *p = NULL;
+  unsigned u;
+  int i = 0,use_bo = 0;
+  CHECK_OBJ_NOTNULL(vmp, VMOD_PEER_IP_MAGIC);
+  vp = vmp->vp;
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
+  if(ctx->bo != NULL && ctx->req == NULL) {
+    req = ctx->bo->req;
+    use_bo++;
+  } else
+    req = ctx->req;
+
+  if(req == NULL)
+    return NULL;
+
+  AN(ctx->ws);
+  WS_Assert(ctx->ws);
+  u = WS_Reserve(ctx->ws,0);
+
+  if(ctx->method == VCL_MET_RECV)
+    i = HTTP1_CacheReqBody(req,PRNDDN(u+1));
+  WS_Release(ctx->ws,0);
+  if(i == -1 || req->req_body_status != REQ_BODY_CACHED) {
+    if(i == -1)
+      VSLb((use_bo ? ctx->bo->vsl : ctx->vsl),SLT_VCL_Error,
+           "req.body not cached (%d): %s",errno,strerror(errno));
+    else
+      VSLb((use_bo ? ctx->bo->vsl : ctx->vsl),SLT_VCL_Error,
+           "req.body is not cached and/or running outside of vcl_recv");
+    if(use_bo)
+      VSLb_ts_busyobj(ctx->bo, "Bereq", VTIM_real());
+    else
+      VSLb_ts_req(req, "ReqBody", VTIM_real());
+    return NULL;
+  }
+  b = VSB_new_auto();
+  AN(b);
+  HTTP1_IterateReqBody(req, vp_iter_req_body, b);
+  if(req->req_body_status == REQ_BODY_FAIL || VSB_finish(b) != 0) {
+    if(use_bo) {
+      VSLb(ctx->bo->vsl, SLT_VCL_Error, "reading bereq cached body: %d (%s)",
+            errno,strerror(errno));
+      VSLb_ts_busyobj(ctx->bo, "Bereq", VTIM_real());
+    } else {
+      VSLb(ctx->vsl, SLT_VCL_Error, "reading req body: %d (%s)",
+           errno,strerror(errno));
+      VSLb_ts_req(req, "ReqBody", VTIM_real());
+    }
+  } else if((req->req_body_status != REQ_BODY_DONE) && (req->req_body_status != REQ_BODY_CACHED)) {
+    VSLb((use_bo ? ctx->bo->vsl : ctx->vsl),SLT_VCL_Error,
+          "unexpected req_body_status iterating cached request body (%d)",
+          (int)req->req_body_status);
+    if(use_bo)
+      VSLb_ts_busyobj(ctx->bo, "Bereq", VTIM_real());
+    else
+      VSLb_ts_req(req, "ReqBody", VTIM_real());
+  } else {
+    if(VSB_len(b) > 0) {
+      unsigned l = VSB_len(b)+1;
+      u = WS_Reserve(ctx->ws,0);
+      if(u >= l) {
+        p = (char*)ctx->ws->f;
+        memcpy(p,VSB_data(b),l);
+        WS_Release(ctx->ws,l);
+      } else
+        WS_Release(ctx->ws,0);
+    }
+  }
+  VSB_delete(b);
+  return p;
+}
+/* SSL */
+VCL_VOID
+V4_VMOD_PEER(ip,set_ssl, VCL_STRING cafile, VCL_STRING capath)
+{
+  struct vmod_peer *vp;
+  CHECK_OBJ_NOTNULL(vmp, VMOD_PEER_IP_MAGIC);
+  vp = vmp->vp;
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
+  AZ(pthread_mutex_lock(&vp->mtx));
+  if(cafile && *cafile)
+    vp->ssl_cafile = cafile;
+  else
+    vp->ssl_cafile = NULL;
+  if(capath && *capath)
+    vp->ssl_capath = capath;
+  else
+    vp->ssl_capath = NULL;
+  if((vp->ssl_cafile || vp->ssl_capath) && !vp->ssl_flags)
+    vp->ssl_flags |= VP_SSL_ON;
+  AZ(pthread_mutex_unlock(&vp->mtx));
+}
+
+VCL_VOID
+V4_VMOD_PEER(ip,set_ssl_verification, VCL_ENUM vtype, VCL_BOOL enable)
+{
+  struct vmod_peer *vp;
+  CHECK_OBJ_NOTNULL(vmp, VMOD_PEER_IP_MAGIC);
+  vp = vmp->vp;
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
+  AN(vtype);
+  if(strcmp(vtype,"peer") == 0) {
+    AZ(pthread_mutex_lock(&vp->mtx));
+    if(enable)
+      vp->ssl_flags |= VP_SSL_VERIFY_PEER;
+    else
+      vp->ssl_flags &= ~VP_SSL_VERIFY_PEER;
+    AZ(pthread_mutex_unlock(&vp->mtx));
+  } else if(strcmp(vtype,"host") == 0) {
+    AZ(pthread_mutex_lock(&vp->mtx));
+    if(enable)
+      vp->ssl_flags |= VP_SSL_VERIFY_HOST;
+    else
+      vp->ssl_flags &= ~VP_SSL_VERIFY_HOST;
+    AZ(pthread_mutex_unlock(&vp->mtx));
+  } else if(strcmp(vtype,"force") == 0) {
+    AZ(pthread_mutex_lock(&vp->mtx));
+    if(enable)
+      vp->ssl_flags |= VP_SSL_ON;
+    else
+      vp->ssl_flags &= ~VP_SSL_ON;
+    AZ(pthread_mutex_unlock(&vp->mtx));
+  } else {
+    VPLOGR(ctx,SLT_VCL_Error,"unsupport ssl verification type '%s'",vtype);
+  }
 }

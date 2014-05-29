@@ -9,8 +9,9 @@
 #include "vrt.h"
 #include "vsb.h"
 #include "vsa.h"
+#include "vcl.h"
 
-/* FIXME: vrt.h not included in varnish4 header files */
+/* FIXME: vct.h not included in varnish4 header files */
 #include "vct.h"
 
 #include "vcc_if.h"

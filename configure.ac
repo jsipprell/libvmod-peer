@@ -33,7 +33,7 @@ AC_ARG_ENABLE([debug],
   [CFLAGS="-ggdb3 -Wall"
    CPPFLAGS="$CPPFLAGS${CPPFLAGS:+ }-DDEBUG"])
 AC_ARG_ENABLE([devel],
-  [AC_HELP_STRING([--enable-devel],
+  [AS_HELP_STRING([--enable-devel],
                  [enable all warnings, pedantic mode and full debug symbol generation])],
   [CFLAGS="-ggdb3 -Wall -pedantic"
   CPPFLAGS="$CPPFLAGS${CPPFLAGS:+ }-DDEBUG"])

@@ -177,10 +177,106 @@ Example
             cache_peer.enqueue_post({"Form entry
             sent "} + now);
 
+$Method VOID .enqueue_cached_post()
+
+Description
+        Identical to `cache_peer.enqueue_post("...")` except that it takes no
+        arguments but instead uses the `HTTP POST` data cached via a prior
+        call to `peer.cache_post()`.
+Caveats
+        `peer.cache_post()` not only must be called prior to
+        `cache_peer.enqueue_cached_post()`, but `peer.cache_post()` can
+        **only** be called in ``vcl_recv``. Note that it is perfectly
+        acceptable to call this method in a later VCL handler, *including from
+        a backend handler* (i.e. ``vcl_backend_fetch`` or
+        ``vcl_backend_response``). Only `peer.cache_post()` must be called
+        from ``vcl_recv``.
+Example
+        ::
+
+            // Send an HTTP POST to a lookaside cache subsystem
+            sub vcl_init {
+                new mypeer = peer.ip("10.1.2.3",8080);
+            }
+            // Make sure any POST request bodies get cached.
+            sub vcl_recv {
+                if (req.method == "POST") {
+                    peer.cache_post();
+                }
+            }
+            // After each successful catch fetch queue it to our peer.
+            sub vcl_backend_response {
+                if(beresp.status == 200) {
+                    mypeer.enqueue_cached_post();
+                }
+            }
+
 $Method INT .pending()
 
 Description
         Returns the number of outstanding HTTP requests that have not
         yet been processed. Requests are considered pending up until
         they are initiated, **not** when completed.
+
+$Method VOID .set_ssl(STRING, STRING)
+
+Description
+        Enables SSL support (HTTPS scheme) for queued connections. The first
+        argument should be a path to the location of the Certificate Authority
+        file to be used to determine certificate trusts. This argument can be
+        empty ("") if a cafile is not desired. The second argument may be a
+        path to a directory containing Certificate Authority certs. This
+        argument may be empty ("") if a capath is not desired.
+Example
+        ::
+
+            // Enable SSL and trust a private CA
+            cache_peer.set_ssl("/var/lib/ssl/private_ca.pem","");
+
+$Method VOID .set_ssl_verification(ENUM { peer, host, force }, BOOL)
+
+Description
+        Enable or disable SSL certificate verification for HTTPS requests
+        using a given peer object. Verification can be enabled or disabled
+        based on the SSL "peer" or the SSL "host".
+Example
+        ::
+
+            // Disable SSL peer verification
+            cache_peer.set_ssl_verification(peer, false);
+            // Enable SSL host verification
+            cache_peer.set_ssl_verification(host, true);
+
+$Method STRING .body()
+
+Description
+        Return cached request body (usually due to an HTTP `POST`).
+
+$Function VOID cache_post()
+
+Description
+        Cache an HTTP `POST` request body so that it can later be retrieved or
+        queued to an external connection via ``cache_peer.body()`` and
+        ``cache_peer.enqueue_cached_post()``.
+Caveats
+        This function can **only** be called in `vcl_recv`. The
+        ``cache_peer.body()`` method will attempt to perform this function if
+        it is used inside of `vcl_recv`.
+Example
+        ::
+
+            sub vcl_init {
+                new cp = peer.ip("127.0.0.1",0);
+            }
+            sub vcl_recv {
+                if (req.method == "POST") {
+                    peer.cache_post();
+                }
+            }
+            sub vcl_miss {
+                if (req.method == "POST") {
+                    cp.enqueue_cached_post();
+                    return (synth(404,"Post content: "+cp.body()));
+                }
+            }
 
