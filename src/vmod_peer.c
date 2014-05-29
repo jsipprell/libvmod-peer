@@ -19,6 +19,8 @@ struct peer_req {
   char *host,*method,*proto,*url;
   struct vsb *body;
   CURL *c;
+  struct vmod_peer *vp;
+  struct ws *ws; /* note: if same as vp->ws, not released when req is released */
   VTAILQ_HEAD(,vmod_hdr) headers;
   VTAILQ_ENTRY(peer_req) list;
 };
@@ -28,6 +30,7 @@ typedef struct vmod_pthr vmod_pthr_t;
 struct vmod_peer {
   unsigned magic;
 #define VMOD_PEER_MAGIC 0x5bba391c
+  pthread_key_t wsk;
   unsigned nthreads,min,max;
   pthread_mutex_t mtx;
   pthread_cond_t cond;
@@ -53,22 +56,11 @@ struct vmod_pthr {
   struct vmod_peer *vp;
 };
 
+extern void VTCP_name(const struct suckaddr*,char*,unsigned,char*,unsigned);
+
 static int initialized = 0;
 static vp_lock_t *curl_locks[CURL_LOCK_DATA_LAST+1];
 
-static inline
-char *vp_alloc(char *b, size_t *bsz, size_t sz)
-{
-  if(*bsz < sz) {
-    if(b)
-      b = realloc(b, sz);
-    else
-      b = malloc(sz);
-    *bsz = sz;
-    AN(b);
-  }
-  return b;
-}
 
 static inline
 void vp_free(void **vp)
@@ -88,11 +80,61 @@ static int vp_start_thread(struct vmod_peer*);
 static int vp_start_thread_safe(struct vmod_peer*);
 static void vp_log_req(const struct vrt_ctx *ctx, enum VSL_tag_e,
                                             const char *fmt, ...);
-static void vp_log(enum VSL_tag_e, uint32_t, const char *fmt, ...);
+static void vp_log_bare(enum VSL_tag_e, uint32_t, const char *fmt, ...);
+static void vp_log_ws(struct ws*, enum VSL_tag_e, uint32_t,
+                      const char*, ...);
+static void vp_log(const struct vmod_peer*, enum VSL_tag_e, uint32_t id,
+                                                  const char *fmt, ...);
 #define VPLOGR vp_log_req
-#define VPLOG(tag,fmt,...) vp_log((tag),0,(fmt), ## __VA_ARGS__)
+#define VPLOG(tag,fmt,...) vp_log_bare((tag),0,(fmt), ## __VA_ARGS__)
 #define VPLOGFD(tag,fd,fmt,...) vp_log((tag),(fd),(fmt), ## __VA_ARGS__)
+#define VPLOGWS(ws,tag,fmt,...) vp_log_ws((ws),(tag),0,(fmt), ## __VA_ARGS__)
 #define VPLOGIG VPLOGFD
+
+#define VPLOG_Debug(vp,fmt,...) vp_log((vp),SLT_Debug,0,(fmt), ## __VA_ARGS__)
+#define VPLOG_Error(vp,fmt,...) vp_log((vp),SLT_Error,0,(fmt), ## __VA_ARGS__)
+
+static
+void vp_log_ws_va(struct ws *ws, enum VSL_tag_e tag,
+                  uint32_t id, const char *fmt, va_list ap)
+{
+  unsigned u = 0;
+  char *msg,*mark;
+
+  AN(ws);
+  mark = WS_Snapshot(ws);
+  u = WS_Reserve(ws,0);
+  if (u == 0) {
+    WS_Release(ws,0);
+    WS_Reset(ws,mark);
+    return;
+  }
+  msg = ws->f;
+  if (u) {
+    unsigned v;
+    assert(ws->f == msg);
+    v = vsnprintf(msg,u,fmt,ap);
+
+    if (v > 0) {
+      WS_Release(ws, v+1);
+      VSL(tag, 0, "vmod_peer: %s", msg);
+      u = 0;
+    }
+  }
+  if(u)
+    WS_Release(ws,0);
+  WS_Reset(ws,mark);
+}
+
+static
+void vp_log_ws(struct ws *ws, enum VSL_tag_e tag,
+               uint32_t id, const char *fmt, ...)
+{
+  va_list ap;
+  va_start(ap,fmt);
+  vp_log_ws_va(ws,tag,id,fmt,ap);
+  va_end(ap);
+}
 
 static
 void vp_log_req(const struct vrt_ctx *ctx, enum VSL_tag_e tag,
@@ -101,58 +143,122 @@ void vp_log_req(const struct vrt_ctx *ctx, enum VSL_tag_e tag,
   unsigned u = 0;
   va_list ap;
   char *s;
-  char *b = NULL;
-  size_t bsz = 0;
 
 
   CHECK_OBJ_NOTNULL(ctx, VRT_CTX_MAGIC);
-  if (ctx->ws != NULL) {
-    u = WS_Reserve(ctx->ws,0);
-    if(u <= 13) {
-      WS_Release(ctx->ws,u);
-      return;
-    }
-    s = stpcpy(ctx->ws->f,"vmod_peer: ");
-    AN(s);
-    strncpy(s,fmt,u-12);
-    s = ctx->ws->f;
-  } else {
-    b = vp_alloc(b, &bsz, 12 + strlen(fmt));
-    AN(b);
-    s = stpcpy(b, "vmod_peer: ");
-    AN(s);
-    strncpy(s,fmt,u-12);
-    s = b;
+  AN(ctx->ws);
+  u = WS_Reserve(ctx->ws,0);
+  if(u <= 13) {
+    WS_Release(ctx->ws,0);
+    return;
   }
+  s = stpcpy(ctx->ws->f,"vmod_peer: ");
+  AN(s);
+  strncpy(s,fmt,u-12);
+  s = ctx->ws->f;
 
   AN(s);
   va_start(ap,fmt);
   VSLbv(ctx->vsl, tag, s, ap);
   va_end(ap);
-  if(b) {
-    AN(bsz);
-    VPFREE(b);
-  } else {
-    AN(ctx->ws);
-    WS_Release(ctx->ws, u);
-  }
+  WS_Release(ctx->ws, 0);
 }
 
 static
-void vp_log(enum VSL_tag_e tag, uint32_t id, const char *fmt, ...)
+void vp_log_bare(enum VSL_tag_e tag, uint32_t id, const char *fmt, ...)
 {
   va_list ap;
-  char *b = NULL;
-  size_t bsz = 0;
+  char buf[4096],*b = NULL;
   int l;
-  b = vp_alloc(b, &bsz, 4096);
-  AN(b);
+  b = buf;
   va_start(ap,fmt);
   l = vsnprintf(b,4095,fmt,ap);
   va_end(ap);
   if (l < 4094)
     VSL(tag,id,"vmod_peer: %s",b);
-  VPFREE(b);
+}
+
+static inline
+struct ws *vp_ws_new(const char *label, size_t sz)
+{
+  struct ws *ws = NULL;
+  char *m;
+  if (sz <= PRNDUP(sizeof(*ws)))
+    sz = PRNDUP(sz) + PRNDUP(sizeof(*ws));
+  else
+    sz = PRNDUP(sz);
+  AN(sz);
+  m = malloc(sz);
+  if (m != NULL) {
+    ws = (struct ws*)m;
+    m += PRNDUP(sizeof *ws);
+    WS_Init(ws,label,m,sz-PRNDUP(sizeof *ws));
+  }
+  return ws;
+}
+
+static
+struct ws *vmod_peer_ws(pthread_key_t wsk)
+{
+  struct ws *ws;
+
+  ws = pthread_getspecific(wsk);
+  AN(cache_param);
+  AN(cache_param->workspace_session);
+  if(ws == NULL) {
+    ws = vp_ws_new("vpp",cache_param->workspace_session * 4);
+    if(ws != NULL)
+      AZ(pthread_setspecific(wsk,ws));
+  }
+  return ws;
+}
+
+static
+struct ws *vmod_peer_ip_ws(const struct vmod_peer_ip *vpp)
+{
+  CHECK_OBJ_NOTNULL(vpp, VMOD_PEER_IP_MAGIC);
+  return vmod_peer_ws(vpp->wsk);
+}
+
+static
+struct ws *vp_ws_get(const struct vmod_peer *vp)
+{
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
+  return vmod_peer_ws(vp->wsk);
+}
+
+static
+int vp_ws_check(const struct vmod_peer *vp, struct ws **p)
+{
+  struct ws *ws;
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
+  ws = pthread_getspecific(vp->wsk);
+  if(ws == NULL) {
+    if(p)
+      *p = NULL;
+    return 0;
+  }
+  if(p)
+    *p = ws;
+  return 1;
+}
+
+static
+void vp_ws_free(void *v)
+{
+  WS_Assert((struct ws*)v);
+  free(v);
+}
+
+static
+void vp_log(const struct vmod_peer *vp, enum VSL_tag_e tag,
+             uint32_t id, const char *fmt, ...)
+{
+  va_list ap;
+  struct ws *ws = vp_ws_get(vp);
+  va_start(ap,fmt);
+  vp_log_ws_va(ws,tag,id,fmt,ap);
+  va_end(ap);
 }
 
 static
@@ -211,18 +317,23 @@ void vp_req_add_header(struct vmod_peer *ctx, struct peer_req *r,
 }
 
 static
-struct peer_req *vp_req_new(struct vmod_peer *ctx) {
+struct peer_req *vp_req_new(struct vmod_peer *vp) {
   struct peer_req *r;
 
-  CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
   r = calloc(1,sizeof(*r));
   AN(r);
   r->magic = VMOD_PEER_REQ_MAGIC;
+  r->vp = vp;
+  AN(cache_param);
+  AN(cache_param->workspace_session);
+  if(!vp_ws_check(vp,&r->ws))
+    r->ws = vp_ws_new("vpq",cache_param->workspace_session * 4);
   r->c = NULL;
   r->body = NULL;
   r->host = r->url = r->proto = r->method = NULL;
   VTAILQ_INIT(&r->headers);
-  vp_req_add_header(ctx,r,"Connection","close");
+  vp_req_add_header(vp,r,"Connection","close");
   return r;
 }
 
@@ -270,6 +381,7 @@ struct peer_req *vp_req_init(struct vmod_peer *vp, struct http *hp)
       free(k);
     }
   }
+  assert(r->vp == vp);
   return r;
 }
 
@@ -324,30 +436,40 @@ void vp_req_free(struct peer_req *r)
     free(h->value);
     free(h);
   }
+  if(r->ws != NULL) {
+    if(r->vp != NULL) {
+      struct ws *ws;
+      if(vp_ws_check(r->vp,&ws) && r->ws != ws)
+        VPFREE(r->ws);
+      else if (ws == NULL)
+        VPFREE(r->ws);
+    } else
+      VPFREE(r->ws);
+  }
 }
 
 static
-struct vmod_pthr *vp_alloc_thread(struct vmod_peer *ctx)
+struct vmod_pthr *vp_alloc_thread(struct vmod_peer *vp)
 {
   vmod_pthr_t *p;
 
-  CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
 
-  if(ctx->tsz == 0) {
-    ctx->threads = calloc(2,sizeof(*p));
-    AN(ctx->threads);
-    ctx->tsz = 2;
-  } else while(ctx->tsz <= ctx->nthreads) {
-    AN(ctx->threads);
-    ctx->tsz *= 2;
-    ctx->threads = realloc(ctx->threads, ctx->tsz * sizeof(*p));
-    AN(ctx->threads);
+  if(vp->tsz == 0) {
+    vp->threads = calloc(2,sizeof(*p));
+    AN(vp->threads);
+    vp->tsz = 2;
+  } else while(vp->tsz <= vp->nthreads) {
+    AN(vp->threads);
+    vp->tsz *= 2;
+    vp->threads = realloc(vp->threads, vp->tsz * sizeof(*p));
+    AN(vp->threads);
   }
 
-  p = &ctx->threads[ctx->nthreads++];
+  p = &vp->threads[vp->nthreads++];
   p->magic = VMOD_PEER_THREAD_MAGIC;
-  p->vp = ctx;
-  p->shutdown = &ctx->shutdown;
+  p->vp = vp;
+  p->shutdown = &vp->shutdown;
   return p;
 }
 
@@ -364,37 +486,46 @@ size_t vp_write_data(char *ptr, size_t sz, size_t n, void *rv)
 static
 int vp_debug_callback(CURL *c, curl_infotype t, char *msg, size_t sz, void *rv)
 {
-  char *b = NULL;
-  size_t bsz = 0;
+  char *b,*mark;
+  unsigned u;
   struct peer_req *r = (struct peer_req*)rv;
+  struct ws *ws;
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
-
-  if(msg && sz > 0) {
-    b = vp_alloc(b,&bsz,sz+1);
-    strncpy(b,msg,sz);
+  CHECK_OBJ_NOTNULL(r->vp, VMOD_PEER_MAGIC);
+  ws = vp_ws_get(r->vp);
+  AN(ws);
+  mark = WS_Snapshot(ws);
+  u = WS_Reserve(ws,PRNDUP(sz+1));
+  AN(u);
+  b = ws->f;
+  if(u < sz)
+    sz = u-1;
+  if(msg) {
+    if(sz > 0)
+      strncpy(b,msg,sz);
     *(b+sz) = '\0';
   }
+  WS_Release(ws,sz+1);
 
   switch(t) {
   case CURLINFO_DATA_IN:
     break;
   case CURLINFO_DATA_OUT:
   case CURLINFO_HEADER_OUT:
-    VSL(SLT_Debug, 0, "peer req %p > %s", r, b);
+    VPLOG_Debug(r->vp,"req:%p > %s", r, b);
     break;
   case CURLINFO_HEADER_IN:
-    VSL(SLT_Debug, 0, "peer req %p < %s", r, b);
+    VPLOG_Debug(r->vp,"req:%p < %s", r, b);
     break;
   case CURLINFO_TEXT:
-    VSL(SLT_Debug, 0, "peer req %p: %s", r, b);
+    VPLOG_Debug(r->vp,"req:%p: %s", r, b);
     break;
   default:
-    VSL(SLT_Debug, 0, "peer req %p unexpected debug type %d",r,(int)t);
+    VPLOG_Debug(r->vp,"req:%p unexpected debug type %d",r,(int)t);
     break;
   }
 
-  if(b)
-    free(b);
+  WS_Reset(ws,mark);
   return 0;
 }
 #endif /* DEBUG */
@@ -409,9 +540,9 @@ int vp_enqueue(struct vmod_peer *vp, struct peer_req *r,
   AZ(pthread_mutex_lock(&vp->mtx));
   if((vp->qlen+1) / vp->nthreads > VMOD_PEER_MAX_QUEUE_DEPTH) {
     if(vp->nthreads >= vp->max || vp_start_thread(vp) != 0) {
-      VPLOGR(ctx, SLT_Error, "vmod_peer: queue depth would exceed %u/%u, waiters=%u, add more threads?",
+      VPLOGR(ctx, SLT_VCL_Error, "vmod_peer: queue depth would exceed %u/%u, waiters=%u, add more threads?",
               (unsigned)vp->qlen, (unsigned)vp->nthreads, (unsigned)vp->nwaiters);
-      VPLOGR(ctx, SLT_Error, "vmod_peer: discarding %p %s", r, r->url);
+      VPLOGR(ctx, SLT_VCL_Error, "vmod_peer: discarding %p %s", r, r->url);
       AZ(pthread_mutex_unlock(&vp->mtx));
       vp_req_free(r);
       return -1;
@@ -431,17 +562,22 @@ static
 void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req *r)
 {
   struct curl_slist *req_headers = NULL;
-  char *cp,*b = NULL;
-  char *body;
-  size_t blen,bsz = 0;
+  char *cp;
+  char *body,*b,*mark;
+  size_t blen;
+  unsigned bsz,u;
   int cl_set = 0, expect_set = 0;
   CURLcode cr;
   long status = 0;
   vmod_hdr_t *h;
+  struct ws *ws;
 
   CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
 
+  ws = vp_ws_get(vp);
+  AN(ws);
+  mark = WS_Snapshot(ws);
   if(!r->c)
     r->c = curl_easy_init();
   AN(r->c);
@@ -454,7 +590,15 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
       cl_set++;
     else if(strcasecmp(h->key,"expect") == 0)
       expect_set++;
-    b = vp_alloc(b,&bsz,strlen(h->key)+strlen(h->value)+3);
+    bsz = strlen(h->key) + strlen(h->value) + 3;
+
+    u = WS_Reserve(ws,PRNDUP(bsz));
+    if(u < bsz) {
+      WS_Release(ws,0);
+      VPLOG_Error(vp, "out of space for header %s",h->key);
+      continue;
+    }
+    b = ws->f;
     cp = stpcpy(b,h->key);
     AN(cp);
     *cp++ = ':';
@@ -465,6 +609,7 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
       *cp = '\0';
     req_headers = curl_slist_append(req_headers,b);
     AN(req_headers);
+    WS_Release(ws,0);
   }
 
   if(r->body && !VSB_done(r->body))
@@ -552,29 +697,38 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
   if(vp->d_to > -1)
     curl_easy_setopt(r->c, CURLOPT_TIMEOUT_MS, (long)vp->d_to);
 
-  b = vp_alloc(b,&bsz,strlen(r->host)+strlen(r->url)+10);
-  cp = stpcpy(b,"http://");
-  AN(cp);
-  cp = stpcpy(cp,r->host);
-  AN(cp);
-  if(*r->url != '/')
-    *cp++ = '/';
-  AN(stpcpy(cp, r->url));
-  AN(b);
-  curl_easy_setopt(r->c, CURLOPT_URL, b);
-  VSL(SLT_Debug, 0, "peer req %p url %s",r,b);
-  cr = curl_easy_perform(r->c);
-  if(cr != 0) {
-    const char *err = curl_easy_strerror(cr);
-    VSL(SLT_Error, 0, "peer req %p (%s) error: %s",r,b,err);
+  bsz = strlen(r->host)+strlen(r->url)+10;
+  u = WS_Reserve(ws,PRNDUP(bsz));
+  if (u <= bsz) {
+    WS_Release(ws,0);
+    VPLOG_Error(vp,"req:%p url:%s, nomem (%u bytes allocated, need %u)",r,r->url,u,
+                (unsigned)bsz);
+  } else {
+    cp = stpcpy(ws->f,"http://");
+    AN(cp);
+    cp = stpcpy(cp,r->host);
+    AN(cp);
+    if(*r->url != '/')
+      *cp++ = '/';
+    cp = stpcpy(cp, r->url);
+    AN(cp);
+    b = ws->f;
+    WS_ReleaseP(ws, cp+1);
+    curl_easy_setopt(r->c, CURLOPT_URL, b);
+    VPLOG_Debug(vp,"req:%p url:%s",r,b);
+    cr = curl_easy_perform(r->c);
+    if(cr != 0) {
+      const char *err = curl_easy_strerror(cr);
+      VPLOG_Error(vp,"req:%p (%s) error: %s",r,b,err);
+    }
+    curl_easy_getinfo(r->c, CURLINFO_RESPONSE_CODE, &status);
+    VPLOG_Debug(vp,"req:%p (%s) complete: %ld", r, b, status);
   }
-  curl_easy_getinfo(r->c, CURLINFO_RESPONSE_CODE, &status);
-  VSL(SLT_Debug, 0, "peer req %p (%s) complete: %ld", r, b, status);
-  free(b);
   if(req_headers)
     curl_slist_free_all(req_headers);
   if(body)
     curl_free(body);
+  WS_Reset(ws,mark);
 }
 
 static
@@ -615,7 +769,7 @@ VMOD_THREAD_FUNC vmod_peer_thread(void *vctx)
   vp = thr->vp;
   CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
   vmod_peer_thread_register(thr);
-  VSL(SLT_Debug, 0, "peer thread %p started",vp);
+  VPLOG(SLT_Debug, "peer thread %p started",vp);
   AZ(pthread_mutex_lock(&vp->mtx));
   do {
     struct peer_req *r;
@@ -642,18 +796,18 @@ VMOD_THREAD_FUNC vmod_peer_thread(void *vctx)
 }
 
 static
-int vp_start_thread(struct vmod_peer *ctx)
+int vp_start_thread(struct vmod_peer *vp)
 {
   struct vmod_pthr *p;
   pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
   pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
-  p = vp_alloc_thread(ctx);
+  p = vp_alloc_thread(vp);
   CHECK_OBJ_NOTNULL(p, VMOD_PEER_THREAD_MAGIC);
   AZ(pthread_mutex_lock(&mtx));
   p->imtx = &mtx;
   p->icond = &cond;
-  p->shutdown = &ctx->shutdown;
+  p->shutdown = &vp->shutdown;
   AZ(pthread_create(&p->tid,NULL,vmod_peer_thread,p));
   while(p->alive == 0)
     AZ(pthread_cond_wait(&cond,&mtx));
@@ -663,12 +817,12 @@ int vp_start_thread(struct vmod_peer *ctx)
 }
 
 static
-int vp_start_thread_safe(struct vmod_peer *ctx)
+int vp_start_thread_safe(struct vmod_peer *vp)
 {
-  CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
-  AZ(pthread_mutex_lock(&ctx->mtx));
-  vp_start_thread(ctx);
-  return pthread_mutex_unlock(&ctx->mtx);
+  CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
+  AZ(pthread_mutex_lock(&vp->mtx));
+  vp_start_thread(vp);
+  return pthread_mutex_unlock(&vp->mtx);
 }
 
 static
@@ -740,7 +894,7 @@ static
 void vp_lock_curl_data(CURLSH *s, curl_lock_data data, curl_lock_access access, void *va)
 {
 #if 0
-  VSL(SLT_Debug, 0, "vp_lock_curl_data data=%d access=%d",(int)data,(int)access);
+  VPLOG(SLT_Debug, "vp_lock_curl_data data=%d access=%d",(int)data,(int)access);
 #endif
   if(access == CURL_LOCK_ACCESS_SHARED)
     AZ(vp_lock_read_acquire(curl_locks[data]));
@@ -752,7 +906,7 @@ static
 void vp_unlock_curl_data(CURLSH *s, curl_lock_data data, void *va)
 {
 #if 0
-  VSL(SLT_Debug, 0, "vp_unlock_curl_data data=%d access=%d",(int)data,(int)access);
+  VPLOG(SLT_Debug, "vp_unlock_curl_data data=%d access=%d",(int)data,(int)access);
 #endif
   AZ(vp_lock_release(curl_locks[data]));
 }
@@ -797,8 +951,12 @@ struct vmod_peer *init_function(const struct vrt_ctx *ctx)
     AN(vp->csh);
     AZ(curl_share_setopt(vp->csh, CURLSHOPT_LOCKFUNC, vp_lock_curl_data));
     AZ(curl_share_setopt(vp->csh, CURLSHOPT_UNLOCKFUNC, vp_unlock_curl_data));
+#ifdef CURL_LOCK_DATA_DNS
     AZ(curl_share_setopt(vp->csh, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS));
+#endif
+#ifdef CURL_LOCK_DATA_SSL_SESSION
     AZ(curl_share_setopt(vp->csh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION));
+#endif
     AZ(curl_share_setopt(vp->csh, CURLSHOPT_USERDATA, vp));
     while(rv == 0 && vp->nthreads < vp->min)
       rv = vp_start_thread_safe(vp);
@@ -807,61 +965,10 @@ struct vmod_peer *init_function(const struct vrt_ctx *ctx)
   return (rv == 0 ? vp : NULL);
 }
 
-VCL_VOID
-vmod_ip__init(const struct vrt_ctx *ctx, struct vmod_peer_ip **vpp,
-              const char *vcl_name, VCL_IP addr)
+static
+void vp_set_host_port(const struct vrt_ctx *ctx, struct vmod_peer *vp,
+                      const char *host, int port)
 {
-  char *host = NULL;
-  const struct sockaddr *sa;
-  socklen_t sl = VSA_Len(addr);
-
-  AN(vpp);
-  *vpp = NULL;
-  ALLOC_OBJ(*vpp, VMOD_PEER_IP_MAGIC);
-  AN(*vpp);
-  sa = VSA_Get_Sockaddr(addr,&sl);
-  AN(sa);
-  (*vpp)->addr = VSA_Malloc(sa,sl);
-  assert(VSA_Sane((*vpp)->addr));
-  (*vpp)->name = vcl_name;
-  (*vpp)->vp = init_function(ctx);
-
-  if((*vpp)->addr) {
-    host = VRT_IP_string(ctx, (*vpp)->addr);
-    if(host) {
-      AZ(pthread_mutex_lock(&(*vpp)->vp->mtx));
-      if((*vpp)->vp->host)
-        VPFREE((*vpp)->vp->host);
-      (*vpp)->vp->host = strdup(host);
-      AN((*vpp)->vp->host);
-      AZ(pthread_mutex_unlock(&(*vpp)->vp->mtx));
-    }
-  }
-}
-
-VCL_VOID
-vmod_ip__fini(struct vmod_peer_ip **vpp)
-{
-  AN(vpp);
-  if(*vpp) {
-    struct vmod_peer *vp;
-    CHECK_OBJ_NOTNULL(*vpp, VMOD_PEER_IP_MAGIC);
-    vp = (*vpp)->vp;
-    (*vpp)->vp = NULL;
-    if(vp)
-      vmod_peer_stop(vp);
-    VPFREE((*vpp)->addr);
-    FREE_OBJ(*vpp);
-    *vpp = NULL;
-  }
-}
-
-VCL_VOID
-V4_VMOD_PEER(ip,set,VCL_STRING host, VCL_INT port)
-{
-  struct vmod_peer *vp;
-  CHECK_OBJ_NOTNULL(vmp, VMOD_PEER_IP_MAGIC);
-  vp = vmp->vp;
   CHECK_OBJ_NOTNULL(vp, VMOD_PEER_MAGIC);
   AZ(pthread_mutex_lock(&vp->mtx));
 
@@ -871,24 +978,85 @@ V4_VMOD_PEER(ip,set,VCL_STRING host, VCL_INT port)
     vp->port = port;
 
   if(host && *host) {
-    char *b = NULL;
-    size_t bsz = 0;
     if (vp->host)
       VPFREE(vp->host);
-
-    if (port != -1 && vp->port != port) {
-      size_t sz = strlen(host)+8;
-      b = vp_alloc(b,&bsz,sz);
-      (void)snprintf(b,sz,"%s:%u",host,(unsigned)port);
-      host = b;
-    }
     vp->host = strdup(host);
-    if(b)
-      free(b);
   } else if(vp->host)
     VPFREE(vp->host);
 
   AZ(pthread_mutex_unlock(&vp->mtx));
+}
+
+VCL_VOID
+vmod_ip__init(const struct vrt_ctx *ctx, struct vmod_peer_ip **vpp,
+              const char *vcl_name, VCL_IP addr, VCL_INT port)
+{
+  char *host = NULL;
+  const struct sockaddr *sa;
+  socklen_t sl = VSA_Len(addr);
+  struct ws *ws;
+
+  AN(vpp);
+  *vpp = NULL;
+
+  if (port < 0 || port > 65535) {
+    VPLOG(SLT_VCL_Error, "%d is an invalid port number", port);
+    port = -1;
+  }
+  ALLOC_OBJ(*vpp, VMOD_PEER_IP_MAGIC);
+  AN(*vpp);
+  sa = VSA_Get_Sockaddr(addr,&sl);
+  AN(sa);
+  (*vpp)->addr = VSA_Malloc(sa,sl);
+  assert(VSA_Sane((*vpp)->addr));
+  (*vpp)->name = vcl_name;
+  (*vpp)->vp = init_function(ctx);
+  AZ(pthread_key_create(&(*vpp)->wsk,vp_ws_free));
+  ws = vmod_peer_ip_ws(*vpp);
+  WS_Assert(ws);
+  (*vpp)->vp->wsk = (*vpp)->wsk;
+
+  if((*vpp)->addr) {
+    unsigned len;
+
+    len = WS_Reserve(ws,0);
+    assert(len > 20);
+    host = ws->f;
+    AN(host);
+    *host = '\0';
+    VTCP_name((*vpp)->addr, host, len, NULL, 0);
+
+    if(host && *host) {
+      vp_set_host_port(ctx, (*vpp)->vp, host, port);
+      port = -1;
+    }
+    WS_Release(ws,0);
+  }
+  if (port != -1)
+    vp_set_host_port(ctx, (*vpp)->vp, NULL,port);
+}
+
+VCL_VOID
+vmod_ip__fini(struct vmod_peer_ip **vpp)
+{
+  AN(vpp);
+  if(*vpp) {
+    struct ws *ws;
+    struct vmod_peer *vp;
+    CHECK_OBJ_NOTNULL(*vpp, VMOD_PEER_IP_MAGIC);
+    vp = (*vpp)->vp;
+    (*vpp)->vp = NULL;
+    if(vp)
+      vmod_peer_stop(vp);
+    VPFREE((*vpp)->addr);
+    ws = pthread_getspecific((*vpp)->wsk);
+    AZ(pthread_key_delete((*vpp)->wsk));
+    if(ws)
+      vp_ws_free(ws);
+
+    FREE_OBJ(*vpp);
+    *vpp = NULL;
+  }
 }
 
 VCL_VOID
@@ -944,7 +1112,7 @@ V4_VMOD_PEER(ip,set_threads, VCL_INT min, VCL_INT max)
     rv = vp_start_thread_safe(vp);
     if (rv != 0) {
       if(errno != 0)
-        VPLOGR(ctx, SLT_Error, "vmod_peer cannot start new thread: %s",
+        VPLOGR(ctx, SLT_VCL_Error, "vmod_peer cannot start new thread: %s",
             strerror(errno));
     }
     AZ(pthread_mutex_lock(&vp->mtx));
@@ -1054,7 +1222,7 @@ void vmod_enqueue_post_va(const struct vrt_ctx *ctx,
     if (p != NULL) {
       size_t vl = strlen(p);
       if(vp_req_append(r,p,vl) != 0 && r->body && r->body->s_error != 0) {
-        VPLOGR(ctx, SLT_Error, "peer req %p (%s) queue_req_body: %s",
+        VPLOGR(ctx, SLT_VCL_Error, "req:%p (%s) queue_req_body: %s",
             p,r->url,strerror(r->body->s_error));
         l = -1;
         break;

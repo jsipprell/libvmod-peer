@@ -40,6 +40,7 @@ struct vmod_peer_ip {
   const char *name;
   struct suckaddr *addr;
   struct vmod_peer *vp;
+  pthread_key_t wsk;
 };
 
 #define V4_VMOD_PEER(sym,name,...) \

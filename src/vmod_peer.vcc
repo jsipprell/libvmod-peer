@@ -3,8 +3,8 @@ $Module peer 3 Varnish 4.0.0+  Cache Peering Module
 |
 | // Send all backend requests to a statistics tracking peer
 | sub vcl_init {
-|    // Create new peer, can only be called in vcl_init
-|    new cache_peer = peer.ip("10.1.2.3");
+|    // Create new peer to be contacted at 10.1.2.3 port 8000, can only be called in vcl_init
+|    new cache_peer = peer.ip("10.1.2.3",8000);
 |    // 250ms connect timeout
 |    cache_peer.set_connect_timeout(250);
 |    // 2 second total timeout per-connection
@@ -25,36 +25,24 @@ operations to other Varnish neighbors or even remote Content Distribution
 Networks. Such HTTP calls are performed asyncronously via a separate thread
 pool.
 
-$Object ip(IP)
+$Object ip(IP,INT)
 
 Returns a new peering object which will be able to communicate asyncronously
-with the specificed IP address.
+with the specificed IP address and destination port number
 
+Caveats
+        Specifying a port number of 0 will always use the standard HTTP port
+        (80). The cache peer object can only be created from within
+        `vcl_init`.
+
+        This function does* **not** *set the HTTP "Host" header.* The ``Host``
+        header is set to whatever the current ``req.http`` headers contain at
+        the time `cache_peer.enqueue()` or `cache_peer.enqueue_post()` is
+        called. If you need to set ``Host`` change ``req.http`` (or
+        ``bereq.http``) immediately before queueing a request and then change
+        it back immediately after.
 Example
-        new cache_peer = peer.ip("10.1.2.3");
-
-$Method VOID .set(STRING,INT)
-
-Description
-        Configures the IP address and port number of a cache peer. Hostnames
-        can technically be used, but doing so unless your libcurl has
-        explicitly been compiled to use a thread-safe dns resolver library is
-        *not recommended*.
-
-        If the port number is 0 the standard HTTP port (80) will be used.
-
-        This function should probably be called just once from within `vcl_init`.
-
-        *Note: This function does* **not** *set the HTTP "Host" header.* The
-        ``Host`` header is set to whatever the current ``req.http`` headers
-        contain at the time `cache_peer.enqueue_req()` or
-        `cache_peer.enqueue_req_body()` is called. If you need to set ``Host``
-        change ``req.http`` immediately before queueing a request and then
-        change it back immediately after.
-Example
-        ::
-
-            cache_peer.set("10.9.1.111",8888);
+        new cache_peer = peer.ip("10.1.2.3",0);
 
 $Method VOID .set_threads(INT, INT)
 
