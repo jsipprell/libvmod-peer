@@ -2,7 +2,7 @@ AC_PREREQ([2.63])
 AC_COPYRIGHT([Copyright (c) 2014 Jesse Sipprell
 All Rights Reserved])
 builtin(include, m4/compat.m4)dnl
-AC_INIT([libvmod-peer], [1.0])
+AC_INIT([varnish-libvmod-peer], [3.01])
 AC_CONFIG_MACRO_DIR(m4)
 AC_CONFIG_AUX_DIR(build)
 AC_CONFIG_SRCDIR([src/vmod_peer.vcc])
@@ -20,6 +20,7 @@ AX_PTHREAD
 AS_VAR_IF([ax_pthread_ok],[yes],[],
   [PTHREAD_CC=gcc])
 AC_PROG_CC([$PTHREAD_CC])
+AC_PROG_CC_STDC
 LT_INIT([disable-static])
 
 AC_PROG_INSTALL
