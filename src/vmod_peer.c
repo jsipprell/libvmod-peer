@@ -411,8 +411,6 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
       *cp = '\0';
     req_headers = curl_slist_append(req_headers,b);
     AN(req_headers);
-    free(b);
-    b = NULL;
   }
 
   if(r->body && !VSB_done(r->body))
