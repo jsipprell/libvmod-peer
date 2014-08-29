@@ -978,7 +978,7 @@ void vmod_enqueue_post_ap(struct sess *sp, struct vmod_priv *priv,
     if (p != NULL) {
       size_t vl = strlen(p);
       if(vp_req_append(r,p,vl) != 0 && r->body && r->body->s_error != 0) {
-        VSL(SLT_Error, sp->id, "peer req %p (%s) queue_req_body: %s",
+        VSL(SLT_Error, sp->id, "peer req %p (%s) vp_enqueue: %s",
             p,r->url,strerror(r->body->s_error));
         l = -1;
         break;
@@ -995,6 +995,15 @@ void vmod_enqueue_post_ap(struct sess *sp, struct vmod_priv *priv,
 
 void vmod_enqueue_req_body(struct sess *sp, struct vmod_priv *priv,
                            const char *s, ...)
+{
+  va_list ap;
+  va_start(ap,s);
+  vmod_enqueue_post_ap(sp,priv,s,ap);
+  va_end(ap);
+}
+
+void vmod_queue_req_body(struct sess *sp, struct vmod_priv *priv,
+                         const char *s, ...)
 {
   va_list ap;
   va_start(ap,s);
