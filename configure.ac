@@ -20,6 +20,7 @@ AX_PTHREAD
 AS_VAR_IF([ax_pthread_ok],[yes],[],
   [PTHREAD_CC=gcc])
 AC_PROG_CC([$PTHREAD_CC])
+AC_PROG_CC_STDC
 LT_INIT([disable-static])
 
 AC_PROG_INSTALL
