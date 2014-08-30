@@ -8,6 +8,14 @@
 
 #include "vmod_peer.h"
 
+#ifndef VP_NEW_GLOBAL_LOCK
+#define VP_NEW_GLOBAL_LOCK(lck) vp_mutex_new(lck,vcl)
+#endif
+
+#ifndef VP_NEW_LOCK
+#define VP_NEW_LOCK(lck,nam) vp_mutex_new(lck,wq)
+#endif
+
 typedef struct vmod_hdr {
   char *key, *value;
   VTAILQ_ENTRY(vmod_hdr) list;
@@ -54,8 +62,11 @@ struct vmod_pthr {
 };
 
 static int initialized = 0;
-static pthread_mutex_t gmtx = PTHREAD_MUTEX_INITIALIZER;
+/* static pthread_mutex_t gmtx = PTHREAD_RECURSIVE_MUTEX_INITIALIZER; */
+static struct lock gmtx;
+
 static vp_lock_t *curl_locks[CURL_LOCK_DATA_LAST+1];
+static unsigned int max_q_depth = VMOD_PEER_MAX_QUEUE_DEPTH;
 
 static inline
 char *vp_alloc(char *b, size_t *bsz, size_t sz)
@@ -86,6 +97,20 @@ void vp_free(void **vp)
 }
 
 #define VPFREE(x) vp_free((void**)&(x))
+
+/* Note: always call with mutex locked */
+static inline unsigned vp_count_alive_threads(struct vmod_peer *ctx)
+{
+  unsigned i,nalive;
+
+  for(i = 0, nalive = 0; i < ctx->nthreads; i++) {
+    if(ctx->threads[i].magic && ctx->threads[i].tid != (pthread_t)0)
+      nalive += ctx->threads[i].alive;
+  }
+  return nalive;
+}
+
+#define VP_THREADS_ALIVE(ctx) vp_count_alive_threads(ctx)
 
 /* forward decls */
 static int vp_start_thread(struct vmod_peer*);
@@ -270,22 +295,34 @@ void vp_req_free(struct peer_req *r)
 static
 struct vmod_pthr *vp_alloc_thread(struct vmod_peer *ctx)
 {
-  vmod_pthr_t *p;
+  vmod_pthr_t *p = NULL;
 
   CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
-
+  vp_mutex_lock(&gmtx);
   if(ctx->tsz == 0) {
     ctx->threads = calloc(2,sizeof(*p));
     AN(ctx->threads);
     ctx->tsz = 2;
-  } else while(ctx->tsz <= ctx->nthreads) {
+  } else if(ctx->tsz <= ctx->nthreads) {
     AN(ctx->threads);
-    ctx->tsz *= 2;
-    ctx->threads = realloc(ctx->threads, ctx->tsz * sizeof(*p));
-    AN(ctx->threads);
+    while(ctx->tsz <= ctx->nthreads) {
+      ctx->tsz *= 2;
+      ctx->threads = realloc(ctx->threads, ctx->tsz * sizeof(*p));
+      AN(ctx->threads);
+    }
+  } else {
+    int i;
+    for(i = 0; i < ctx->nthreads; i++) {
+      if(!ctx->threads[i].magic && ctx->threads[i].tid == (pthread_t)0) {
+        p = &ctx->threads[i];
+        AZ(p->alive);
+        break;
+      }
+    }
   }
 
-  p = &ctx->threads[ctx->nthreads++];
+  if(!p)
+    p = &ctx->threads[ctx->nthreads++];
   p->magic = VMOD_PEER_THREAD_MAGIC;
   p->vp = ctx;
   p->alive = 0;
@@ -293,6 +330,7 @@ struct vmod_pthr *vp_alloc_thread(struct vmod_peer *ctx)
   p->imtx = NULL;
   p->icond = NULL;
   p->shutdown = &ctx->shutdown;
+  vp_mutex_unlock(&gmtx);
   return p;
 }
 
@@ -326,16 +364,16 @@ int vp_debug_callback(CURL *c, curl_infotype t, char *msg, size_t sz, void *rv)
     break;
   case CURLINFO_DATA_OUT:
   case CURLINFO_HEADER_OUT:
-    VSL(SLT_Debug, 0, "peer req %p > %s", r, b);
+    VSL(SLT_Debug, 0, "vmod_peer req %p > %s", r, b);
     break;
   case CURLINFO_HEADER_IN:
-    VSL(SLT_Debug, 0, "peer req %p < %s", r, b);
+    VSL(SLT_Debug, 0, "vmod_peer req %p < %s", r, b);
     break;
   case CURLINFO_TEXT:
-    VSL(SLT_Debug, 0, "peer req %p: %s", r, b);
+    VSL(SLT_Debug, 0, "vmod_peer req %p: %s", r, b);
     break;
   default:
-    VSL(SLT_Debug, 0, "peer req %p unexpected debug type %d",r,(int)t);
+    VSL(SLT_Debug, 0, "vmod_peer req %p unexpected debug type %d",r,(int)t);
     break;
   }
 
@@ -352,14 +390,17 @@ int vp_queue_req(struct vmod_peer *vp, struct peer_req *r, struct sess *sp)
   CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
 
   AZ(pthread_mutex_lock(&vp->mtx));
-  if((vp->qlen+1) / vp->nthreads > VMOD_PEER_MAX_QUEUE_DEPTH) {
-    if(vp->nthreads >= vp->max || vp_start_thread(vp) != 0) {
+  if((vp->qlen+1) / vp->nthreads > max_q_depth) {
+    if(VP_THREADS_ALIVE(vp) >= vp->max) {
       VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: queue depth would exceed %u/%u, waiters=%u, add more threads?",
               (unsigned)vp->qlen, (unsigned)vp->nthreads, (unsigned)vp->nwaiters);
       VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: discarding %p %s", r, r->url);
-      AZ(pthread_mutex_unlock(&vp->mtx));
-      vp_req_free(r);
-      return -1;
+      errno = EINVAL;
+      goto vp_queue_req_err;
+    } else if(vp_start_thread(vp) != 0) {
+      VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: discarding %p %s, cannot start new thread: %s",
+              r, r->url, strerror(errno));
+      goto vp_queue_req_err;
     }
   }
   VTAILQ_INSERT_HEAD(&vp->q, r, list);
@@ -370,6 +411,14 @@ int vp_queue_req(struct vmod_peer *vp, struct peer_req *r, struct sess *sp)
   VSL(SLT_Debug, (sp ? sp->id : 0), "vmod_peer: qlen=%u/threads=%u/waiters=%u",
             (unsigned)vp->qlen,(unsigned)vp->nthreads,(unsigned)vp->nwaiters);
   return pthread_mutex_unlock(&vp->mtx);
+vp_queue_req_err:
+  do {
+    int e = errno;
+    vp_req_free(r);
+    AZ(pthread_mutex_unlock(&vp->mtx));
+    errno = e;
+  } while(0);
+  return -1;
 }
 
 static
@@ -508,14 +557,14 @@ void vp_process_req(struct vmod_peer *vp, struct vmod_pthr *thr, struct peer_req
     *cp++ = '/';
   AN(stpcpy(cp, r->url));
   curl_easy_setopt(r->c, CURLOPT_URL, b);
-  VSL(SLT_Debug, 0, "peer req %p url %s",r,b);
+  VSL(SLT_Debug, 0, "vmod_peer req %p url %s",r,b);
   cr = curl_easy_perform(r->c);
   if(cr != 0) {
     const char *err = curl_easy_strerror(cr);
-    VSL(SLT_Error, 0, "peer req %p (%s) error: %s",r,b,err);
+    VSL(SLT_Error, 0, "vmod_peer req %p (%s) error: %s",r,b,err);
   }
   curl_easy_getinfo(r->c, CURLINFO_RESPONSE_CODE, &status);
-  VSL(SLT_Debug, 0, "peer req %p (%s) complete: %ld", r, b, status);
+  VSL(SLT_Debug, 0, "vmod_peer req %p (%s) complete: %ld", r, b, status);
   free(b); b = NULL;
   if(req_headers)
     curl_slist_free_all(req_headers);
@@ -527,6 +576,7 @@ static struct vmod_peer
 *vmod_peer_thread_register(struct vmod_pthr *thr)
 {
   struct vmod_peer *vp = NULL;
+  pthread_t tid;
   pthread_mutex_t *mtx;
   pthread_cond_t *cond;
   CHECK_OBJ_NOTNULL(thr, VMOD_PEER_THREAD_MAGIC);
@@ -545,10 +595,11 @@ static struct vmod_peer
   thr->imtx = NULL;
   thr->icond = NULL;
   vp = thr->vp;
+  tid = thr->tid;
   AZ(pthread_cond_signal(cond));
   AZ(pthread_mutex_unlock(mtx));
   AN(vp);
-  VSL(SLT_Debug, 0, "peer thread %p registered",(void*)thr->tid);
+  VSL(SLT_Debug, 0, "vmod_peer: thread %p registered",(void*)thr->tid);
   return vp;
 }
 
@@ -557,7 +608,7 @@ void vmod_peer_thread_unregister(struct vmod_pthr *thr) {
   CHECK_OBJ_NOTNULL(thr, VMOD_PEER_THREAD_MAGIC);
   AN(thr->alive);
   thr->alive--;
-  VSL(SLT_Debug, 0, "peer thread %p unregistered",(void*)thr->tid);
+  VSL(SLT_Debug, 0, "vmod_peer: thread %p unregistered",(void*)thr->tid);
   AZ(thr->alive);
 }
 
@@ -582,7 +633,8 @@ VMOD_THREAD_FUNC vmod_peer_thread(void *vctx)
     for(r = VTAILQ_FIRST(&vp->q); !*thr->shutdown && vp->qlen > 0; r = VTAILQ_FIRST(&vp->q)) {
       CHECK_OBJ_NOTNULL(r, VMOD_PEER_REQ_MAGIC);
       VTAILQ_REMOVE(&vp->q, r, list);
-      vp->qlen--;
+      if(vp->qlen > 0)
+        vp->qlen--;
       AZ(pthread_mutex_unlock(&vp->mtx));
       vp_process_req(vp,thr,r);
       vp_req_free(r);
@@ -590,10 +642,10 @@ VMOD_THREAD_FUNC vmod_peer_thread(void *vctx)
     }
   } while(!*thr->shutdown);
 
-  AZ(pthread_mutex_lock(&gmtx));
+  vp_mutex_lock(&gmtx);
   vmod_peer_thread_unregister(thr);
+  vp_mutex_unlock(&gmtx);
   AZ(pthread_mutex_unlock(&vp->mtx));
-  AZ(pthread_mutex_unlock(&gmtx));
   return NULL;
 }
 
@@ -632,57 +684,56 @@ void vmod_peer_stop(void *v)
 {
   struct peer_req *r, *r2;
   struct vmod_peer *ctx = (struct vmod_peer*)v;
-  int nalive;
+  int i,nalive;
 
-  AZ(pthread_mutex_lock(&gmtx));
+  vp_mutex_lock(&gmtx);
   if(!initialized) {
-    AZ(pthread_mutex_unlock(&gmtx));
+    vp_mutex_unlock(&gmtx);
     return;
   }
   CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
-  do {
-    int i;
+  AZ(pthread_mutex_lock(&ctx->mtx));
+  ctx->shutdown++;
+  for(i = 0; i < ctx->nthreads; i++)
+    ctx->threads[i].shutdown = &ctx->shutdown;
 
-    AZ(pthread_mutex_lock(&ctx->mtx));
-
-    VTAILQ_FOREACH_SAFE(r, &ctx->q, list, r2) {
-      VTAILQ_REMOVE(&ctx->q,r,list);
-      vp_req_free(r);
-    }
-
-    for(i = nalive = 0; i < ctx->nthreads; i++) {
-      ctx->threads[i].shutdown = &ctx->shutdown;
-      nalive += ctx->threads[i].alive;
-    }
-
-    ctx->shutdown++;
-    if(nalive) {
-      for(i = 0; i < ctx->nthreads; i++) {
-        pthread_t tid;
-        if((tid = ctx->threads[i].tid) != (pthread_t)0) {
-          CHECK_OBJ_NOTNULL(&ctx->threads[i], VMOD_PEER_THREAD_MAGIC);
+  for(nalive = VP_THREADS_ALIVE(ctx); nalive > 0; nalive = VP_THREADS_ALIVE(ctx),
+                                                  ctx->shutdown++) {
+    for(i = 0; i < ctx->nthreads; i++) {
+      pthread_t tid;
+      if((tid = ctx->threads[i].tid) != (pthread_t)0) {
+        CHECK_OBJ_NOTNULL(&ctx->threads[i], VMOD_PEER_THREAD_MAGIC);
+        if(ctx->nwaiters > 1)
           AZ(pthread_cond_broadcast(&ctx->cond));
-          AZ(pthread_mutex_unlock(&ctx->mtx));
-          AZ(pthread_mutex_unlock(&gmtx));
-          pthread_join(tid,NULL);
-          AZ(pthread_mutex_lock(&gmtx));
-          AZ(pthread_mutex_lock(&ctx->mtx));
-          assert(!ctx->threads[i].alive);
-          tid = ctx->threads[i].tid = (pthread_t)0;
-        }
+        else
+          AZ(pthread_cond_signal(&ctx->cond));
+        AZ(pthread_mutex_unlock(&ctx->mtx));
+        vp_mutex_unlock(&gmtx);
+        pthread_join(tid,NULL);
+        vp_mutex_lock(&gmtx);
+        AZ(pthread_mutex_lock(&ctx->mtx));
+        assert(pthread_equal(tid,ctx->threads[i].tid));
+        assert(!ctx->threads[i].alive);
+        tid = ctx->threads[i].tid = (pthread_t)0;
+        ctx->threads[i].magic = 0;
       }
     }
+    ctx->shutdown++;
+  }
 
-    AZ(pthread_mutex_unlock(&ctx->mtx));
-  } while(nalive > 0);
-
+  VTAILQ_FOREACH_SAFE(r, &ctx->q, list, r2) {
+    VTAILQ_REMOVE(&ctx->q,r,list);
+    vp_req_free(r);
+  }
+  ctx->qlen = 0;
   if(ctx->csh) {
     curl_share_cleanup(ctx->csh);
     ctx->csh = NULL;
   }
 
-  pthread_cond_destroy(&ctx->cond);
-  pthread_mutex_destroy(&ctx->mtx);
+  AZ(pthread_mutex_unlock(&ctx->mtx));
+  AZ(pthread_cond_destroy(&ctx->cond));
+  AZ(pthread_mutex_destroy(&ctx->mtx));
   if(ctx->host)
     VPFREE(ctx->host);
   if(ctx->threads)
@@ -700,7 +751,8 @@ void vmod_peer_stop(void *v)
     }
     curl_global_cleanup();
   }
-  AZ(pthread_mutex_unlock(&gmtx));
+  vp_mutex_unlock(&gmtx);
+  vp_mutex_deinit();
 }
 
 static
@@ -730,7 +782,16 @@ int init_function(struct vmod_priv *priv, const struct VCL_conf *conf)
   int rv = 0;
   struct vmod_peer *ctx;
 
-  AZ(pthread_mutex_lock(&gmtx));
+  vp_mutex_init();
+  if(!initialized) {
+    AZ(gmtx.priv);
+    VP_NEW_GLOBAL_LOCK(&gmtx);
+    AZ(vp_mutex_set_recursion(&gmtx,1,NULL));
+  } else
+    AN(gmtx.priv);
+
+  vp_mutex_assert(&gmtx,0);
+  vp_mutex_lock(&gmtx);
 
   ctx = calloc(1,sizeof(*ctx));
   AN(ctx);
@@ -776,7 +837,7 @@ int init_function(struct vmod_priv *priv, const struct VCL_conf *conf)
     while(rv == 0 && ctx->nthreads < ctx->min)
       rv = vp_start_thread_safe(ctx);
   }
-  AZ(pthread_mutex_unlock(&gmtx));
+  vp_mutex_unlock(&gmtx);
   return rv;
 }
 
@@ -816,10 +877,85 @@ void vmod_set(struct sess *sp, struct vmod_priv *priv, const char *host, int por
   AZ(pthread_mutex_unlock(&ctx->mtx));
 }
 
+static void rebalance_threading(struct sess *sp, struct vmod_peer *ctx)
+{
+  int i,rv;
+  unsigned target,nalive;
+
+  CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
+  AZ(pthread_mutex_lock(&ctx->mtx));
+  if(ctx->shutdown || !ctx->tsz) {
+    AZ(pthread_mutex_unlock(&ctx->mtx));
+    return;
+  }
+  vp_mutex_lock(&gmtx);
+  nalive = VP_THREADS_ALIVE(ctx);
+  AN(max_q_depth);
+  target = (ctx->qlen / max_q_depth)+1;
+  if(ctx->max > 0 && target > ctx->max)
+    target = ctx->max;
+  if(ctx->min > 0 && target < ctx->min)
+    target = ctx->min;
+
+  for(i = ctx->nthreads-1; i > 0 && nalive != target && !ctx->shutdown;
+                                                i = (i == 0 ? i = ctx->nthreads-1 : i-1),
+                                                nalive = VP_THREADS_ALIVE(ctx)) {
+    /* too many threads, get rid of some */
+    pthread_t tid;
+    int shutdown = 1;
+
+    vmod_pthr_t *t = &ctx->threads[i];
+    CHECK_OBJ_NOTNULL(t, VMOD_PEER_THREAD_MAGIC);
+    tid = t->tid;
+
+    if(tid == (pthread_t)0 && !t->alive) {
+      t->magic = 0;
+      if(i == ctx->nthreads-1)
+        ctx->nthreads--;
+      continue;
+    }
+    assert(tid != (pthread_t)0);
+
+    if(nalive > target) {
+      t->shutdown = &shutdown;
+
+      if(ctx->nwaiters > 1)
+        AZ(pthread_cond_broadcast(&ctx->cond));
+      else
+        AZ(pthread_cond_signal(&ctx->cond));
+      vp_mutex_unlock(&gmtx);
+      AZ(pthread_mutex_unlock(&ctx->mtx));
+      pthread_join(tid, NULL);
+      AZ(pthread_mutex_lock(&ctx->mtx));
+      vp_mutex_lock(&gmtx);
+      AN(ctx->threads);
+      assert(i < ctx->nthreads && ctx->threads[i].tid == tid);
+      t = &ctx->threads[i];
+      CHECK_OBJ_NOTNULL(t, VMOD_PEER_THREAD_MAGIC);
+      assert(!t->alive);
+      t->magic = 0;
+      t->tid = (pthread_t)0;
+      if(i+1 == ctx->nthreads)
+        ctx->nthreads--;
+    } else if(nalive < target) {
+      rv = vp_start_thread(ctx);
+      if(rv != 0) {
+        if(errno != 0)
+          VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: cannot start new thread: %s",
+              strerror(errno));
+        if(target > 0)
+          target--;
+      }
+    }
+  }
+
+  AZ(pthread_mutex_unlock(&ctx->mtx));
+  vp_mutex_unlock(&gmtx);
+}
+
 void vmod_set_threads(struct sess *sp, struct vmod_priv *priv, int min, int max)
 {
   struct vmod_peer *ctx = (struct vmod_peer*)priv->priv;
-  int rv;
 
   CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
   if(max > 0 && min > 0 && max < min)
@@ -837,40 +973,8 @@ void vmod_set_threads(struct sess *sp, struct vmod_priv *priv, int min, int max)
       ctx->min = max;
   }
 
-  while(ctx->nthreads > ctx->max) {
-    /* too many threads, get rid of some */
-    pthread_t tid;
-    int shutdown = 1;
-    vmod_pthr_t *t = &ctx->threads[ctx->nthreads-1];
-    if(!t->alive) {
-      ctx->nthreads--;
-      continue;
-    }
-    CHECK_OBJ_NOTNULL(t, VMOD_PEER_THREAD_MAGIC);
-    tid = t->tid;
-    t->shutdown = &shutdown;
-    if(ctx->nwaiters != 1)
-      AZ(pthread_cond_broadcast(&ctx->cond));
-    else
-      AZ(pthread_cond_signal(&ctx->cond));
-    AZ(pthread_mutex_unlock(&ctx->mtx));
-    pthread_join(tid, NULL);
-    AZ(pthread_mutex_lock(&ctx->mtx));
-    assert(!t->alive);
-    ctx->nthreads--;
-    t->magic = 0;
-  }
-  for(rv = 0; rv == 0 && ctx->nthreads < ctx->min; ) {
-    AZ(pthread_mutex_unlock(&ctx->mtx));
-    rv = vp_start_thread_safe(ctx);
-    if (rv != 0) {
-      if(errno != 0)
-        VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer cannot start new thread: %s",
-            strerror(errno));
-    }
-    AZ(pthread_mutex_lock(&ctx->mtx));
-  }
   AZ(pthread_mutex_unlock(&ctx->mtx));
+  rebalance_threading(sp,ctx);
 }
 
 int vmod_threads(struct sess *sp, struct vmod_priv *priv)
@@ -928,6 +1032,87 @@ int vmod_pending(struct sess *sp, struct vmod_priv *priv)
   return qlen;
 }
 
+static pthread_cond_t vp_gcond = PTHREAD_COND_INITIALIZER;
+static pthread_t vp_gc = (pthread_t)0;
+static unsigned vp_gw = 0;
+
+void vmod_lock(struct sess *sp)
+{
+  pthread_t tid = pthread_self();
+  vp_mutex_lock(&gmtx);
+  vp_mutex_assertheld(&gmtx);
+
+  if(vp_gc != (pthread_t)0 && !pthread_equal(vp_gc,tid)) {
+    vp_gw++;
+    while(vp_gc != (pthread_t)0 && !pthread_equal(vp_gc,tid)) {
+      vp_mutex_assertheld(&gmtx);
+      vp_mutex_condwait(&vp_gcond,&gmtx);
+      vp_mutex_assertheld(&gmtx);
+    }
+    vp_mutex_assertheld(&gmtx);
+    vp_gw--;
+
+    if(vp_gc == (pthread_t)0)
+      vp_gc = tid;
+  }
+
+  vp_mutex_unlock(&gmtx);
+  vp_mutex_assert(&gmtx,0);
+}
+
+void vmod_unlock(struct sess *sp)
+{
+  pthread_t tid = pthread_self();
+  vp_mutex_assert(&gmtx,0);
+  vp_mutex_lock(&gmtx);
+  if(vp_gc == (pthread_t)0) {
+    VSL(SLT_Error,(sp ? sp->id : 0),"attempt to unlock ignored, lock %p is not held",gmtx.priv);
+    vp_mutex_unlock(&gmtx);
+    return;
+  } else if(!pthread_equal(vp_gc,tid)) {
+    VSL(SLT_Error,(sp ? sp->id : 0),"attempt to unlock %p when held by other thread",gmtx.priv);
+    vp_mutex_unlock(&gmtx);
+    return;
+  }
+  vp_mutex_assertheld(&gmtx);
+
+  if(pthread_equal(vp_gc,tid)) {
+    vp_mutex_assertheld(&gmtx);
+    if(vp_gw > 1)
+      pthread_cond_broadcast(&vp_gcond);
+    else
+      pthread_cond_signal(&vp_gcond);
+    vp_gc = (pthread_t)0;
+  }
+  vp_mutex_assertheld(&gmtx);
+  vp_mutex_unlock(&gmtx);
+  vp_mutex_assert(&gmtx,0);
+}
+
+/* set global maximum number of requests allowed to be queued before a new thread is
+ * started (up to max)
+ */
+void vmod_set_thread_maxq(struct sess *sp, struct vmod_priv *priv, int max)
+{
+  struct vmod_peer *ctx = (struct vmod_peer*)priv->priv;
+  unsigned int old_max;
+  CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
+
+  if(max < 2) {
+    VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: per_thread_maxq must be larger than 1");
+    return;
+  }
+  vp_mutex_lock(&gmtx);
+  old_max = max_q_depth;
+  max_q_depth = max;
+  if(old_max != max_q_depth) {
+    vp_mutex_unlock(&gmtx);
+    rebalance_threading(sp,ctx);
+  } else {
+    vp_mutex_unlock(&gmtx);
+  }
+}
+
 /* set connect timeout in ms */
 void vmod_set_connect_timeout(struct sess *sp, struct vmod_priv *priv, int ms)
 {
@@ -976,7 +1161,7 @@ void vmod_enqueue_post_ap(struct sess *sp, struct vmod_priv *priv,
     if (p != NULL) {
       size_t vl = strlen(p);
       if(vp_req_append(r,p,vl) != 0 && r->body && r->body->s_error != 0) {
-        VSL(SLT_Error, sp->id, "peer req %p (%s) vp_enqueue: %s",
+        VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: peer req %p (%s) vp_enqueue: %s",
             p,r->url,strerror(r->body->s_error));
         l = -1;
         break;
