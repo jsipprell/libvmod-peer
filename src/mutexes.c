@@ -356,6 +356,9 @@ void vp_mutex_condwait(pthread_cond_t *cond, struct lock *lck)
   AN(m->held);
   assert(pthread_equal(m->owner, tid));
   m->held = 0;
+  if(params->diag_bitmap & 0x8)
+    VSL(SLT_Debug, 0, "VPM_WAIT(%s,%d,%s)/%d",__FILE__,__LINE__,m->w,
+          (int)m->recurse);
   AZ(pthread_cond_wait(cond, &m->m));
   AZ(m->held);
   tp = pthread_getspecific(tkey);
@@ -367,4 +370,7 @@ void vp_mutex_condwait(pthread_cond_t *cond, struct lock *lck)
   }
   m->owner = tid;
   m->held = 1;
+  if(params->diag_bitmap & 0x8)
+    VSL(SLT_Debug, 0, "VPM_WAKE(%s,%d,%s)/%d",__FILE__,__LINE__,m->w,
+          (int)m->recurse);
 }

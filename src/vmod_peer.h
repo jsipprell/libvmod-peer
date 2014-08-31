@@ -21,6 +21,14 @@
 #define VMOD_PEER_MAX_QUEUE_DEPTH 50
 #endif
 
+#ifndef VMOD_PEER_MAX_THREAD_POOL
+/* maximum number of threads allowed in the worker thread pool, this will start at the
+ * min setting (1 by default) and grow to the configured max (again, 1 by default) but
+ * the configured max may never exceed this limit.
+ */
+#define VMOD_PEER_MAX_THREAD_POOL 100
+#endif
+
 typedef struct vp_lock vp_lock_t;
 
 extern vp_lock_t *vp_lock_new(pthread_mutexattr_t*,pthread_condattr_t*);
