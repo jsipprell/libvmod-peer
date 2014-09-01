@@ -321,7 +321,7 @@ struct vmod_pthr *vp_alloc_thread(struct vmod_peer *ctx)
   p->magic = VMOD_PEER_THREAD_MAGIC;
   p->vp = ctx;
   p->alive = 0;
-  p->tid = 0;
+  p->tid = (pthread_t)0;
   p->imtx = NULL;
   p->icond = NULL;
   p->shutdown = &ctx->shutdown;
@@ -715,15 +715,16 @@ static
 int vp_start_thread_safe(struct vmod_peer *ctx)
 {
   int locked = 0;
+  int rc = 0;
   CHECK_OBJ_NOTNULL(ctx, VMOD_PEER_MAGIC);
   if(!vp_mutex_isheld(&ctx->mtx)) {
     vp_mutex_lock(&ctx->mtx);
     locked++;
   }
-  vp_start_thread(ctx);
+  rc = vp_start_thread(ctx);
   if(locked)
     vp_mutex_unlock(&ctx->mtx);
-  return 0;
+  return rc;
 }
 
 static
@@ -883,7 +884,7 @@ int init_function(struct vmod_priv *priv, const struct VCL_conf *conf)
     AZ(curl_share_setopt(ctx->csh, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION));
     AZ(curl_share_setopt(ctx->csh, CURLSHOPT_USERDATA, ctx));
     while(rv == 0 && ctx->nthreads < ctx->min)
-      rv = vp_start_thread_safe(ctx);
+      rv = vp_start_thread(ctx);
   }
   vp_mutex_unlock(&gmtx);
   return rv;
@@ -942,7 +943,6 @@ static void rebalance_threading(struct sess *sp, struct vmod_peer *ctx)
     return;
   }
   vp_mutex_lock(&gmtx);
-  nalive = VP_THREADS_ALIVE(ctx);
   AN(max_q_depth);
   target = (ctx->qlen / max_q_depth)+1;
   if(ctx->max > 0 && target > ctx->max)
@@ -950,9 +950,22 @@ static void rebalance_threading(struct sess *sp, struct vmod_peer *ctx)
   if(ctx->min > 0 && target < ctx->min)
     target = ctx->min;
 
-  for(i = ctx->nthreads-1; i > 0 && nalive != target && !ctx->shutdown;
-                                                i = (i == 0 ? ctx->nthreads-1 : i-1),
-                                                nalive = VP_THREADS_ALIVE(ctx)) {
+  for(nalive = VP_THREADS_ALIVE(ctx); nalive < target && !ctx->shutdown; nalive = VP_THREADS_ALIVE(ctx)) {
+    /* not enough threads, add one */
+    rv = vp_start_thread_safe(ctx);
+    if(rv != 0) {
+      if(errno != 0)
+        VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: cannot start new thread: %s",
+            strerror(errno));
+      if(target > 0)
+        target--;
+    }
+  }
+
+  for(i = ctx->nthreads-1, nalive = VP_THREADS_ALIVE(ctx);
+               i > 0 && nalive > target && !ctx->shutdown;
+                          i = (i == 0 ? ctx->nthreads-1 : i-1),
+                               nalive = VP_THREADS_ALIVE(ctx)) {
     /* too many threads, get rid of some */
     pthread_t tid;
     int shutdown = 1;
@@ -970,44 +983,33 @@ static void rebalance_threading(struct sess *sp, struct vmod_peer *ctx)
         ctx->nthreads--;
       }
       continue;
-    }
-    assert(tid != (pthread_t)0);
+    } else if(tid == (pthread_t)0 || !t->alive)
+      continue;
 
-    if(nalive > target) {
-      t->shutdown = &shutdown;
+    t->shutdown = &shutdown;
 
-      if(ctx->nwaiters > 1)
-        AZ(pthread_cond_broadcast(&ctx->cond));
-      else
-        AZ(pthread_cond_signal(&ctx->cond));
-      vp_mutex_unlock(&gmtx);
-      vp_mutex_unlock(&ctx->mtx);
-      pthread_join(tid, NULL);
-      vp_mutex_lock(&ctx->mtx);
-      vp_mutex_lock(&gmtx);
-      AN(ctx->threads);
-      assert(i < ctx->nthreads && pthread_equal(ctx->threads[i].tid,tid));
-      CAST_OBJ_NOTNULL(t, &ctx->threads[i], VMOD_PEER_THREAD_MAGIC);
-      assert(!t->alive);
-      t->tid = (pthread_t)0;
-      t->shutdown = &ctx->shutdown;
-      if(i+1 == ctx->nthreads)
-        ctx->nthreads--;
-    } else if(nalive < target) {
-      rv = vp_start_thread(ctx);
-      if(rv != 0) {
-        if(errno != 0)
-          VSL(SLT_Error, (sp ? sp->id : 0), "vmod_peer: cannot start new thread: %s",
-              strerror(errno));
-        if(target > 0)
-          target--;
-      }
-    }
+    if(ctx->nwaiters > 1)
+      AZ(pthread_cond_broadcast(&ctx->cond));
+    else
+      AZ(pthread_cond_signal(&ctx->cond));
+    vp_mutex_unlock(&gmtx);
+    vp_mutex_unlock(&ctx->mtx);
+    pthread_join(tid, NULL);
+    vp_mutex_lock(&ctx->mtx);
+    vp_mutex_lock(&gmtx);
+    AN(ctx->threads);
+    assert(i < ctx->nthreads && pthread_equal(ctx->threads[i].tid,tid));
+    CAST_OBJ_NOTNULL(t, &ctx->threads[i], VMOD_PEER_THREAD_MAGIC);
+    assert(!t->alive);
+    t->tid = (pthread_t)0;
+    t->shutdown = &ctx->shutdown;
+    if(i+1 == ctx->nthreads)
+      ctx->nthreads--;
   }
 
+  vp_mutex_unlock(&gmtx);
   if(locked)
     vp_mutex_unlock(&ctx->mtx);
-  vp_mutex_unlock(&gmtx);
 }
 
 void vmod_set_threads(struct sess *sp, struct vmod_priv *priv, int min, int max)
@@ -1034,8 +1036,11 @@ void vmod_set_threads(struct sess *sp, struct vmod_priv *priv, int min, int max)
       ctx->min = max;
   }
 
-  vp_mutex_unlock(&ctx->mtx);
+  if(ctx->max == 0 && ctx->min > 0)
+    ctx->max = ctx->min;
+
   rebalance_threading(sp,ctx);
+  vp_mutex_unlock(&ctx->mtx);
 }
 
 int vmod_threads(struct sess *sp, struct vmod_priv *priv)
