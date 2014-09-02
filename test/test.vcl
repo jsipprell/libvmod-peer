@@ -2,62 +2,53 @@ import std;
 import peer;
 
 probe healthcheck {
-  .url = "/server-status";
+  .url = "/varnish-health-probe.txt";
   .interval = 6s;
   .timeout = 2s;
   .window = 8;
   .threshold = 5;
-  .initial = 2;
-  .expected_response = 403;
+  .initial = 5;
+  .expected_response = 200;
 }
 
-backend rpxy005t {
-  .host = "152.52.29.46";
-  .port = "80";
-  .connect_timeout = 3s;
-  .first_byte_timeout = 3s;
+backend rweb029t {
+  .host = "10.1.76.38";
+  .port = "81";
   .probe = healthcheck;
+  .saintmode_threshold = 0;
 }
 
-backend rpxy012t {
-  .host = "152.52.29.39";
-  .port = "80";
-  .connect_timeout = 2s;
-  .first_byte_timeout = 2s;
+backend rweb030t {
+  .host = "10.1.76.52";
+  .port = "81";
   .probe = healthcheck;
+  .saintmode_threshold = 0;
 }
 
-backend kcstar {
-  .host = "166.108.31.147";
-  .port = "80";
-  .connect_timeout = 3s;
-  .first_byte_timeout = 6s;
-  .probe = healthcheck;
-}
-
-director x round-robin {
+director x random {
   {
-    .backend = rpxy005t;
+    .backend = rweb029t;
+    .weight = 1;
   }
   {
-    .backend = rpxy012t;
-  }
-  {
-    .backend = kcstar;
+    .backend = rweb030t;
+    .weight = 1;
   }
 }
 
 sub vcl_init {
-  peer.set("152.52.29.46",99);
+  peer.set("10.4.76.39",8888);
+  #peer.set("10.1.76.39",8888);
   peer.set_connect_timeout(11000);
   peer.set_timeout(30000);
-  peer.set_threads(1, 2);
+  peer.set_threads(1, 4);
+  peer.set_thread_maxq(5);
 }
 
 sub vcl_recv {
   if (req.restarts == 0) {
     set req.backend = x;
-    set req.http.host = "eprod.kansascity.com";
+    set req.http.host = "qa1.kansascity.com";
     unset req.http.cookie;
   }
 
@@ -83,7 +74,7 @@ Pending peer requests: "} + req.http.Peer-Pending-Requests + {"
 sub vcl_hit {
   set req.http.connection = "close";
   set req.http.proxy-connection = "close";
-  set req.http.Host = "www.kansascitystar.com";
+  set req.http.Host = "qa1.kansascity.com";
   peer.queue_req();
 }
 
@@ -92,7 +83,7 @@ sub vcl_miss {
   if (bereq.request == "HEAD") {
     set bereq.request = "GET";
   }
-  set req.http.Host = "www.kansascity.com";
+  set req.http.Host = "qa1.kansas.com";
   peer.queue_req();
   set req.http.Host = bereq.http.Host;
 }
@@ -111,6 +102,9 @@ sub vcl_fetch {
     set beresp.http.Origin-Proxy-Connection = beresp.http.proxy-connection;
   }
   unset beresp.http.set-cookie;
+  if(beresp.status == 200) {
+    set beresp.ttl = 20s;
+  }
 }
 
 sub vcl_deliver {

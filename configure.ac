@@ -2,7 +2,7 @@ AC_PREREQ([2.63])
 AC_COPYRIGHT([Copyright (c) 2014 Jesse Sipprell
 All Rights Reserved])
 builtin(include, m4/compat.m4)dnl
-AC_INIT([varnish-libvmod-peer], [3.01])
+AC_INIT([varnish-libvmod-peer], [3.02])
 AC_CONFIG_MACRO_DIR(m4)
 AC_CONFIG_AUX_DIR(build)
 AC_CONFIG_SRCDIR([src/vmod_peer.vcc])

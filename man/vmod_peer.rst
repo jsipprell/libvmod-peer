@@ -2,249 +2,249 @@
 vmod_peer
 =========
 
---------------------------------
-Varnish Peer Cache Helper Module
---------------------------------
+---------------------------
+Varnish Peer Caching Module
+---------------------------
+
+:Manual section: 3
 
 SYNOPSIS
 ========
 
-import peer;
+``import peer [from "path"];``
 
 DESCRIPTION
 ===========
 
-Varnish module that utilizes libcurl calls to assist in multiplexing HTTP
-operations to other Varnish neighbors or even remote Content Distribution
-Networks. Such HTTP calls are performed asyncronously via a separate thread
-pool.
+vmod_peer is a shared library module for the varnish application acceleration HTTP cache.
+
+It provides a mechanism for VCL (the Varnish configuration language) code to
+queue up independent asyncronous HTTP requests to pre-configured peers at
+specific IP:PORT combinations. This is useful for scalability purposes as it
+permits the distribution of cache invalidation requests to other Varnish caches
+simlutanouesly. vmod_peer's HTTP client functionality is provided by libcurl in
+combination with a request workqueue and thread pool that scales based on load
+demand.
+
+*All requests are handled asyncronously by background threads, vmod_peer
+provides no mechansim for blocking requests or syncronization based on waiting
+until a perivously issued call has completed.*
 
 FUNCTIONS
 =========
 
 set
 ---
-
-Prototype
-        ::
-
-              set(STRING, INT)
-Return value
-        VOID
+Protatype
+    VOID set(STRING, INT)
 Description
-        Configures the IP address and port number of a cache peer. Hostnames
-        can technically be used, but doing so unless your libcurl has
-        explicitly been compiled to use a thread-safe dns resolver library is
-        *not recommended*.
-
-        If the port number is 0 the standard HTTP port (80) will be used.
-
-        This function should probably be called just once from within `vcl_init`.
-
-        *Note: This function does* **not** *set the HTTP "Host" header.* The
-        ``Host`` header is set to whatever the current ``req.http`` headers
-        contain at the time `peer.enqueue_req()` or `peer.enqueue_req_body()`
-        is called. If you need to set ``Host`` change ``req.http`` immediately
-        before queueing a request and then change it back immediately after.
+    Globally sets the IP address and port number that future calls to enqueue_req()
+    with communicate with.
 Example
-        ::
-
-            peer.set("10.9.1.111",8888);
+    ``peer.set("10.11.12.13",80);``
 
 set_threads
------------
-
+--------------------------
 Prototype
-        ::
-
-            set_threads(INT, INT)
-Return value
-        VOID
+  VOID set_threads(INT, INT)
 Description
-        Configures the minimum and maximum number of worker threads which will
-        be started in order to perform queued HTTP operations in the
-        background. By default both minimum and maximum are set to 1, which is
-        also the minimum number configureable. Setting min or max to 0 results
-        in no change to the actual min/max setting but can be used to change
-        one without the other. Attempts to set conflicting or non-sense values
-        will be silently ignored.
-
-        When the maximum number of threads is greater than the minimum, the
-        number of running threads will be scaled based on workload.
-
-        Setting min to a value greater than the current number of running
-        worker threads will result in new threads spawning immediately while
-        conversely setting max *below* the current number will result in excess
-        threads terminating immediately.
+  Configure the minimum and maximum number of threads allowed to be in the vmod_peer
+  thread pool. Default value for min (first argument is 1), default for second arg
+  is 2.
 Example
-        ::
-
-            // Set the new maximum threads to 4 without changing the mininum
-            peer.set_threads(0,4);
-
-set_timeout
------------
-
-Prototype
-        ::
-
-            set_timeout(INT)
-Return value
-        VOID
-Description
-        Set the global (per-operation) HTTP timeout (*starting after connect*)
-        in milliseconds. Operations which exceed this time will fail in the
-        background and add an **Error** entry in the Varnish shared memory log.
-Example
-        ::
-
-            // Set post-connect timeout to .5 seconds
-            peer.set_timeout(500);
-
-set_connect_timeout
--------------------
-
-Prototype
-        ::
-
-            set_connect_timeout(INT)
-Return value
-        VOID
-Description
-        Set the global (per-operation) HTTP connection timeout in milliseconds.
-        Operations which exceed this time before HTTP has started will fail in
-        the background and add an **Error** entry in the Varnish shared memory
-        log.
-Example
-        ::
-
-            // Set connect timeout to .1 seconds
-            peer.set_connect_timeout(100);
-
-enqueue_req
------------
-
-Prototype
-        ::
-
-            enqueue_req()
-
-Return value
-        VOID
-Description
-        Queue a new asyncronous HTTP request for processing by a background
-        thread.  The request will be based on the state of the Varnish ``req``
-        object at the time this function is called. All headers in ``req.http``
-        will be copied to this request except for the `Connection` header.
-        *vmod_peer* does not use http keepalives and thus `Connection: close`
-        is **always** used. In addition to headers, ``req.url``,
-        ``req.request`` and ``req.proto`` are also used when preparing the new
-        request. Once this function has been called, ``req`` can be altered,
-        delivered or discarded at will without changing the background request
-        in progress.
-Caveats
-        If `peer.set("ip",port)` has not been called at least once before this
-        function, the ``req.http.host`` header will be used to establish the
-        background HTTP connection. *This is almost assuredly what you do not
-        want!* However, calling `peer.set` just once in `vcl_init` is
-        sufficient for all future requests.
-Example
-        ::
-
-            // Turn GET requests into PURGEs for a neighboring cache
-            if (req.request == "GET") {
-                set req.request = "PURGE";
-                peer.enqueue_req();
-                set req.request = "GET";
-            }
-
-enqueue_req_body
-----------------
-
-Prototype
-        ::
-
-            enqueue_req_body(STRING_LIST)
-Return value
-        VOID
-Description
-        Identical to `peer.enqueue_req()` except that it takes a single
-        argument which will be used as HTTP ``POST`` content.  The content
-        will be automatically URL-encoding before being sent. Note that using
-        this function will cause the HTTP operation to *always* operate as a
-        ``POST`` irrespective of value of `req.request` (although
-        `req.request` will be the method actually sent in the HTTP command).
-Example
-        ::
-
-            // Send an HTTP POST.
-            set req.request = "POST';
-            peer.enqueue_req_body({"Form entry
-            sent "} + now);
-
-threads
--------
-
-Prototype
-        ::
-
-            threads(VOID)
-Return value
-        INT
-Description
-        Returns the number of threads currently running in the thread pool
-        dedicated to handling `vmod_peer` HTTP requests. No distinction is
-        made between busy threads and those waiting for new requests but
-        this can generally be estimated by examining this value and the
-        ``peer.pending()`` value.
-
-pending
--------
-
-Prototype
-        ::
-
-            pending(VOID)
-Return value
-        INT
-Description
-        Returns the number of outstanding HTTP requests that have not
-        yet been processed. Requests are considered pending up until
-        they are initiated, **not** when completed.
+  ``peer.set_threads(1,2);``
 
 min_threads
 -----------
-
 Prototype
-        ::
-
-            min_threads(VOID)
-Return value
-        INT
+  INT min_threads(VOID)
 Description
-        Returns the minimum number of threads maintained by the HTTP request
-        handling pool. This number should be the same as the first argument in
-        the most recent call to ``peer.set_threads(min,max);``.
-
-        The default value is 1.
+  Returns the minimum number of threads that should be kept running at all times.
+  *Default value is 1*.
+Example
+  ``"min: " + peer.min_threads();``
 
 max_threads
 -----------
-
 Prototype
-        ::
-
-          max_threads(VOID)
-Return value
-        INT
+  INT max_threads(VOID)
 Description
-        Returns the maximum number of threads maintained by the HTTP
-        request handling pool. This number should be the same as the first
-        argument in the most recent call to ``peer.set_threads(min,max);``
+  Returns the maximum number of threads that may be running. The number of running
+  threads can scale up to this maximum depending on load but **never scales down
+  automatically**. *Default value is the same is min_threads which disables 
+  load based scaling.*
+Example
+  ``"max: " + peer.max_threads();``
 
-        The default value is 1.
+threads
+-------
+Prototype
+  INT threads(VOID)
+Description
+  Returns the current number of running threads. Running threads may be either
+  waiting on requests or currentingly processing a request.
+Example
+  ``"alive: " + peer.threads();``
 
-        If the maximum has been set to a value greater than the minimum,
-        the number of actively running threads will be adjusted dynamically
-        based on the pending queue size.
+pending
+-------
+Prototype
+  INT pending(VOID)
+Description
+  Returns the current number of requests waiting in the work queue for a thread
+  to handle them. Requests only set in the pending queue if all threads are
+  already busy handling other requests. Once the number of pending requests
+  exceed the value set by ``set_thread_maxq`` a new thread will be spawned if
+  possible. If the maximum number of threads is already running the request
+  will be discarded.
+Example
+  ``"pending requests: " + peer.pending();``
+
+set_connect_timeout
+-------------------
+Prototype
+  VOID set_connect_timeout(INT)
+Description
+  Set the maximum time in milliseconds that any HTTP connection to a peer cache
+  is allowed to take.
+Example
+  ``peer.set_connect_timeout(1200);``
+
+set_timeout
+-----------
+Prototype
+  VOID set_timeout(INT)
+Description
+  Set the maximum time in milliseconds that any HTTP requests to a peer cache
+  is allowed to take. **This includes the connection time so this value must
+  always be larger than the connect timeout.**
+Example
+  ``peer.set_tiemout(2000);``
+
+set_thread_maxq
+---------------
+Prototype
+  VOID set_thread_maxq(INT)
+Description
+  Set the maximum number of requests that will be allowed to queue up before
+  a new thread is started. *The default value is 50 whih may be too low*.
+  This value must **always** be at least *2*.
+Example
+  ``peer.set_thread_maxq(20);``
+
+lock
+----
+Prototype
+  VOID lock(VOID)
+Description
+  Acquire a cooperative global lock against the vmod_peer module so that any other
+  varnish threads that call ``lock`` will block until the current thread calls
+  ``unlock``. It is safe to call ``lock`` recursively from the same thread but
+  additional calls perform no operations.
+  **Use this with extreme caution, as it's only needed in very special cases.**
+Example
+  ``peer.lock();``
+
+unlock
+------
+Prototype
+  VOID unlock(VOID)
+Description
+  Unlock a previously acquireed cooperative global lock and wake up on varnish
+  thread that is waiting on the lock (if there are any). If ``unlock`` is called
+  without ``lock`` first being called by the same thread nothing happens.
+  **Use this with extreme caution, as it's only needed in very special cases.**
+Example
+  ``peer.unlock();``
+
+enqueue_req
+-----------
+Prototype
+  VOID enqueue_req(VOID)
+Description
+  Schedules a new background asyncronous HTTP request to the configured cache peer
+  using the headers found in the `req` objects. The request will be a "snapshot" of
+  the `req` object so that future changes will affect new requests but not the
+  one created by this call becomes immutable.
+Example
+  ``peer.enqueue_req();``
+
+
+EXAMPLE VCL
+===========
+
+.. _example_vcl:
+
+::
+
+    sub vcl_init {
+      peer.set("10.1.2.3",80);
+      peer.set_timeout(2000);
+      peer.set_connect_timeout(1000);
+      peer.set_threads(1,2);
+      peer.set_thread_maxq(10);
+    }
+
+    sub vcl_recl {
+      if(req.retarts == 0) {
+        unset req.http.Purge-Info;
+        unset req.http.Original-Purge-Method;
+        if(req.url ~ "^/purge-status/?$") {
+          set req.http.Pending-Purges = peer.pending();
+          error 200 "Purge Status";
+        } else {
+          unset req.http.Pending-Purges;
+        }
+      }
+    }
+
+    sub vcl_error {
+      if(obj.status == 200 && req.http.Pending-Purges) {
+        set obj.http.content-type = "text/plain;charset=uft-8";
+        set obj.http.generated-by = "Varnish vmod_peer";
+        synthetic {"
+    Queued Purges: "} + req.http.Pending-Purges + {"
+      Min Threads: "} + peer.min_threads() + {"
+      Max Threads: "} + peer.max_threads() + {"
+      Cur Threads: }" + peer.threads() + {"
+    "};
+
+     return deliver;
+    }
+
+    sub send_peer_purge {
+      set req.http.Original-Purge-Method = req.request;
+      set req.request = "VPURGE";
+      unset req.http.Purge-Info;
+      peer.enqueue_req();
+      set req.http.Purge-Info = "Purge " + req.request + " queued";
+      set req.request = req.http.Original-Purge-Method;
+      unset req.http.Original-Purge-Method;
+    }
+
+    sub vcl_hit {
+      if(req.request ~ "^V?PURGE$") {
+        if (req.request == "PURGE") {
+          call send_peer_purge;
+        }
+        purge;
+        error 200 "purged";
+      }
+    }
+
+    sub vcl_miss {
+      if(req.request ~ "^V?PURGE$") {
+        if (req.request == "PURGE") {
+          call send_peer_purge;
+        }
+        purge;
+        error 404 "not found";
+      }
+    }
+
+    sub vcl_deliver {
+      if(req.http.Purge-Info) {
+        set resp.http.Purge-Info = req.http.Purge-Info;
+      }
+    }
 
